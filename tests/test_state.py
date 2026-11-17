@@ -138,6 +138,21 @@ def test_persistence_roundtrip() -> dict:
     return {"persistence_roundtrip": True}
 
 
+def test_migration_backup() -> dict:
+    """Перед первой конвертацией 0.1.x остаётся копия .bak-<ts>, и только одна."""
+    store = new_store()
+    store.path.write_text(json.dumps({"pending": {"a": {"text": "x"}}, "sent": [], "inbox": []}),
+                          encoding="utf-8")
+    data = store.read()
+    assert data.get("_migrated_v2") is True
+    baks = sorted(store.path.parent.glob(store.path.name + ".bak-*"))
+    assert len(baks) == 1, baks
+    assert json.loads(baks[0].read_text(encoding="utf-8"))["pending"], "backup is not the 0.1 doc"
+    store.read()
+    assert len(sorted(store.path.parent.glob(store.path.name + ".bak-*"))) == 1
+    return {"migration_backup": True}
+
+
 def main() -> int:
     results = {}
     for name, fn in (
@@ -147,6 +162,7 @@ def main() -> int:
         ("expiry", test_card_expiry_and_task_expiry),
         ("active", test_active_filter),
         ("migration", test_legacy_migration),
+        ("backup", test_migration_backup),
         ("persistence", test_persistence_roundtrip),
     ):
         results.update(fn())

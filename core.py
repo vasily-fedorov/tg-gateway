@@ -26,10 +26,14 @@ import threading
 import time
 from pathlib import Path
 
-try:  # normal package import (live plugin)
+try:  # normal package import (plugin loaded as a package)
     from . import state as task_state
-except ImportError:  # loaded by path in tests
-    import state as task_state
+except ImportError:  # loaded as a standalone module (tests, ingress copy)
+    import importlib.util as _ilu
+    _spec_state = _ilu.spec_from_file_location("gateway_relay_state",
+                                               Path(__file__).with_name("state.py"))
+    task_state = _ilu.module_from_spec(_spec_state)
+    _spec_state.loader.exec_module(task_state)
 from typing import Any, Dict, Optional, Tuple
 
 CODE_TTL_S = 900           # approval window

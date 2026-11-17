@@ -87,7 +87,20 @@ class TaskStore:
             raw = {}
         if not isinstance(raw, dict):
             raw = {}
+        if raw and not raw.get("_migrated_v2"):
+            self._backup_once()
         return self._migrate(raw)
+
+    def _backup_once(self) -> None:
+        """Копия 0.1.x-документа перед первой конвертацией в задачи."""
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            target = self.path.with_suffix(self.path.suffix + f".bak-{stamp}")
+            if not target.exists():
+                target.write_text(self.path.read_text(encoding="utf-8"), encoding="utf-8")
+                os.chmod(target, 0o600)
+        except OSError:
+            pass
 
     def write(self, data: Dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
