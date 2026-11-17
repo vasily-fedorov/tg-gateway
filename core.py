@@ -609,10 +609,13 @@ def drain_approved_in(ctx: Any = None) -> int:
         with store.mutate() as state:
             task_state.TaskStore.transition(state, task_id, "completed" if ok else "failed",
                                             last_error=None if ok else str(info)[:200])
-            if ok:
+            if not ok:
+                # Доставленные ответы в инбокс не дублируем — они уже в топике.
+                # В инбокс попадает только то, что владелец ещё не видел: недоставленное.
                 state.setdefault("inbox", []).append({
                     "task": task_id, "peer": peer, "text": text[:2000], "reply": payload[:2000],
-                    "thread_id": item.get("thread_id"), "ts": time.time(), "read": False})
+                    "thread_id": item.get("thread_id"), "ts": time.time(), "read": False,
+                    "undelivered": True})
                 state["inbox"] = state["inbox"][-30:]
         _audit("inbound_answered" if ok else "inbound_answer_failed", task=task_id, peer=peer,
                ok=bool(ok), message_id=str(info))

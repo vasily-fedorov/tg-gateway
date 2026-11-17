@@ -238,6 +238,7 @@ def run() -> dict:
     assert done == 1, done
     assert sent and "30 ГБ" in sent[0][1], sent
     assert any(t["task_id"] == disk["task_id"] and t["status"] == "completed" for t in tasks("in"))
+    assert not store.read().get("inbox"), "доставленный ответ не должен попадать в инбокс"
     res["drain_ask_via_default"] = True
 
     # 16. drain: ASK, default не смог -> карточка владельцу, input-required
