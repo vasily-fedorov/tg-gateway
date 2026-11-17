@@ -530,6 +530,19 @@ def _run_profile_turn(body: str) -> str:
     return reply
 
 
+def _ask_own_default(question: str) -> str:
+    """Спросить собственный default-профиль (тихий ход CLI). '' если ответа нет."""
+    try:
+        res = json.loads(tool_ask_default({"question": question}))
+    except Exception as exc:  # noqa: BLE001
+        _audit("ask_default_error", error=str(exc)[:200])
+        return ""
+    if res.get("ok"):
+        return str(res.get("answer") or "").strip()
+    _audit("ask_default_failed", error=str(res.get("error") or "")[:200])
+    return ""
+
+
 def drain_approved_in(ctx: Any = None) -> int:
     """Approved inbound tasks -> one quiet turn of this profile -> DONE / ASK / SKIP."""
     store = _store()
@@ -544,9 +557,12 @@ def drain_approved_in(ctx: Any = None) -> int:
         peer = str(item.get("peer") or "")
         hop = int(item.get("hops") or 1)
         body = ("[СЛУЖЕБНЫЙ РЕЖИМ gateway: интерактивного канала нет, clarify НЕДОСТУПЕН. "
-                "Сообщение уже принято владельцем через карточку. Ответь РОВНО одной строкой: "
-                "`DONE: <ответ пиру>` если нужен ответ; `ASK: <вопрос владельцу>` если без ответа "
-                "владельца не обойтись; `SKIP` если в сообщении нет вопроса или просьбы.] "
+                "Сообщение уже принято владельцем через карточку. Если нужен факт из системы, "
+                "которого у тебя нет, — вызови инструмент ask_default(<вопрос>) у своего "
+                "default-профиля (он умеет ходить в систему) и используй его ответ. "
+                "Финальный ответ — РОВНО одной строкой: `DONE: <ответ пиру>`; "
+                "`ASK: <вопрос>` только если и ask_default не помог; "
+                "`SKIP` если в сообщении нет вопроса или просьбы.] "
                 f"[gw ctx:{item.get('context_id')} #{hop}] {text}")
         if item.get("answer"):
             body += f"\n[ответ владельца на вопрос «{item.get('question') or ''}»] {item['answer']}"
@@ -562,16 +578,27 @@ def drain_approved_in(ctx: Any = None) -> int:
             continue
         if upper.startswith("ASK:"):
             question = reply.strip()[4:].strip()[:1500]
-            card_chat, card_msg = _send_card_ex(
-                f"Нужен ответ пиру @{peer}.\n\n{question}\n\n"
-                f"Ответьте реплаем на это сообщение.\n\n· задача {task_id}",
-                [("Жду ответа", f"gwin:no:{task_id}")])
-            with store.mutate() as state:
-                task_state.TaskStore.transition(state, task_id, "input-required",
-                                                question=question, card_chat=card_chat,
-                                                card_msg=card_msg)
-            _audit("task_input_required", task=task_id, peer=peer)
-            continue
+            # Своя сторона отвечает сама: спрашиваем свой default-профиль, прежде чем
+            # тревожить владельца карточкой.
+            local = _ask_own_default(question)
+            if local:
+                second = (body + f"\n[ответ твоего default-профиля на вопрос «{question}»] {local}"
+                                 "\nТеперь финальный ответ одной строкой: DONE: <ответ пиру> или SKIP.")
+                reply = _run_profile_turn(second) or ""
+                upper = reply.strip().upper()
+            if not reply.strip() or upper.startswith("ASK:"):
+                if upper.startswith("ASK:"):
+                    question = reply.strip()[4:].strip()[:1500] or question
+                card_chat, card_msg = _send_card_ex(
+                    f"Нужен ответ пиру @{peer}.\n\n{question}\n\n"
+                    f"Ответьте реплаем на это сообщение.\n\n· задача {task_id}",
+                    [("Жду ответа", f"gwin:no:{task_id}")])
+                with store.mutate() as state:
+                    task_state.TaskStore.transition(state, task_id, "input-required",
+                                                    question=question, card_chat=card_chat,
+                                                    card_msg=card_msg)
+                _audit("task_input_required", task=task_id, peer=peer)
+                continue
         payload = reply.strip()
         if payload.upper().startswith("DONE:"):
             payload = payload[5:].strip()

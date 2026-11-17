@@ -212,7 +212,43 @@ def run() -> dict:
                for t in tasks("in")), tasks("in")
     res["ask_answer_by_reply"] = True
 
-    # 15. the quiet-turn reply parsing still works
+    # 15. drain: ASK -> свой default-профиль -> DONE -> ответ пиру
+    with store.mutate() as data:
+        for t in (data.get("tasks") or {}).values():
+            if t.get("status") == "working" and t.get("direction") == "in":
+                mod.task_state.TaskStore.transition(data, t["task_id"], "skipped")
+    asyncio.run(call(make_event("@gateway_alpha сколько свободно на диске / ?", is_bot=True,
+                                user_id=PEER_BOT_ID)))
+    disk = tasks("in", "submitted")[-1]
+    mod.resolve_card_click(f"gwin:ok:{disk['task_id']}", OWNER, "cb6", str(GROUP), "cardA")
+    turns = ["ASK: доступа к диску нет, нужен владелец", "DONE: свободно 30 ГБ"]
+    mod._run_profile_turn = lambda body: turns.pop(0) if turns else ""
+    mod._ask_own_default = lambda q: "на / свободно 30 ГБ"
+    sent.clear()
+    done = mod.drain_approved_in()
+    assert done == 1, done
+    assert sent and "30 ГБ" in sent[0][1], sent
+    assert any(t["task_id"] == disk["task_id"] and t["status"] == "completed" for t in tasks("in"))
+    res["drain_ask_via_default"] = True
+
+    # 16. drain: ASK, default не смог -> карточка владельцу, input-required
+    asyncio.run(call(make_event("@gateway_alpha кому принадлежит домен?", is_bot=True,
+                                user_id=PEER_BOT_ID)))
+    stuck = tasks("in", "submitted")[-1]
+    mod.resolve_card_click(f"gwin:ok:{stuck['task_id']}", OWNER, "cb7", str(GROUP), "cardA")
+    turns = ["ASK: не знаю, нужен владелец", "ASK: без владельца не ответить"]
+    mod._ask_own_default = lambda q: ""
+    cards.clear()
+    sent.clear()
+    mod.drain_approved_in()
+    assert not sent, sent
+    assert cards, "no owner card"
+    state = store.read()
+    assert state["tasks"][stuck["task_id"]]["status"] == "input-required"
+    assert state["tasks"][stuck["task_id"]]["card_msg"]
+    res["drain_ask_escalates_to_owner"] = True
+
+    # 17. the quiet-turn reply parsing still works
     raw = "────\n\u2624 Hermes\nDONE: 42\n────\n\nSession: local-x\n"
     assert mod._extract_reply(raw) == "DONE: 42", mod._extract_reply(raw)
     res["cli_reply_parsing"] = True

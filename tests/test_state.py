@@ -123,6 +123,17 @@ def test_legacy_migration() -> dict:
     return {"legacy_migration": True}
 
 
+def test_working_to_skipped() -> dict:
+    """SKIP в drain — штатный исход working-задачи."""
+    store = new_store()
+    with store.mutate() as data:
+        task = store.create(data, direction="in", peer="peer", text="без вопроса")
+        store.transition(data, task["task_id"], "working")
+        store.transition(data, task["task_id"], "skipped")
+    assert store.get(store.read(), task["task_id"])["status"] == "skipped"
+    return {"working_to_skipped": True}
+
+
 def test_persistence_roundtrip() -> dict:
     store = new_store()
     with store.mutate() as data:
@@ -163,6 +174,7 @@ def main() -> int:
         ("active", test_active_filter),
         ("migration", test_legacy_migration),
         ("backup", test_migration_backup),
+        ("working_skip", test_working_to_skipped),
         ("persistence", test_persistence_roundtrip),
     ):
         results.update(fn())

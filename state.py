@@ -42,7 +42,7 @@ TERMINAL = frozenset({"completed", "failed", "rejected", "cancelled", "skipped"}
 
 ALLOWED: Dict[str, frozenset] = {
     "submitted": frozenset({"working", "rejected", "cancelled", "failed"}),
-    "working": frozenset({"completed", "input-required", "failed", "cancelled"}),
+    "working": frozenset({"completed", "input-required", "failed", "cancelled", "skipped"}),
     "input-required": frozenset({"working", "failed", "cancelled", "skipped"}),
 }
 
