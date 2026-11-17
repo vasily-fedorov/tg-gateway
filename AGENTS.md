@@ -9,16 +9,19 @@
 
 | Файл | Назначение |
 |---|---|
+| `state.py` | Машина состояний задачи: `submitted → working → (input-required) → completed/failed/rejected/cancelled/skipped`, два TTL (карточка 20 мин, задача 24 ч), ленивая миграция старых бакетов. |
 | `core.py` | Вся логика: реестр маршрутов, карточки, callback-резолвер, хук `pre_gateway_dispatch`, watcher, `ask_default`, `gateway_inbox`, аудит. |
 | `__init__.py` | `register(ctx)`: хук + фабрика Telegram-callback-хендлера + регистрация инструментов по домам. |
 | `plugin.yaml` | Манифест: имя, версия, `requires_hermes`, `provides_tools`, `provides_hooks`. |
 | `tests/test_gateway_relay_hook.py` | Юнит-тесты без сети (подменяют `_routes/_state/_tg_*/_send_card`). |
+| `tests/test_state.py` | Переходы состояний, TTL, миграция, персистентность. |
 | `README.md` | Для пользователя: установка, конфиг, модель безопасности. |
 
 ## Проверка перед коммитом
 
 ```bash
 python3 tests/test_gateway_relay_hook.py     # должно быть OK, 0 падений
+python3 tests/test_state.py                  # состояния, TTL, миграция
 python3 -c "import ast; ast.parse(open('core.py').read())"
 ```
 
