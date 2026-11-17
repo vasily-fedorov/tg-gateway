@@ -29,6 +29,19 @@ _SEND_SCHEMA = {
     },
 }
 
+_CANCEL_SCHEMA = {
+    "name": "relay_cancel",
+    "description": (
+        "Отменить свою задачу (только инициатор). Владельцу уходит карточка "
+        "«Отменить?»; после подтверждения пиру отправляется уведомление об отмене."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"task_id": {"type": "string", "description": "task_id из relay_send"}},
+        "required": ["task_id"],
+    },
+}
+
 _ASK_SCHEMA = {
     "name": "ask_default",
     "description": (
@@ -95,6 +108,9 @@ def register(ctx) -> None:
     ctx.register_tool(name="relay_send", toolset="gateway_relay",
                       schema=_SEND_SCHEMA, handler=core.tool_send,
                       description="Relay via an owner-approved card", emoji="\u2709")
+    ctx.register_tool(name="relay_cancel", toolset="gateway_relay",
+                      schema=_CANCEL_SCHEMA, handler=core.tool_cancel,
+                      description="Cancel a submitted task", emoji="\u21a9")
     ctx.register_tool(name="ask_default", toolset="gateway_relay",
                       schema=_ASK_SCHEMA, handler=core.tool_ask_default,
                       description="Ask this agent's default profile", emoji="\U0001f9e0")

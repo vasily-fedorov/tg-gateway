@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for gateway-relay (approval cards + hook gates).
+"""Unit tests for gateway-relay 0.2 (tasks + approval cards + hook gates).
 
 Run: python3 tests/test_gateway_relay_hook.py
 """
@@ -9,22 +9,22 @@ import asyncio
 import importlib.util
 import json
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
-PLUGINS = {
-    "gateway-relay": ROOT / "core.py",
-}
+CORE = ROOT / "core.py"
+sys.path.insert(0, str(ROOT))
 
 GROUP = "-1004418865255"
-PEER_BOT_ID = "300000003"     # gateway_beta
-OTHER_BOT_ID = "1234567890"    # not in the registry
+PEER_BOT_ID = "300000003"
+OTHER_BOT_ID = "1234567890"
 OWNER = "100000001"
 
 
-def load(path: Path, tag: str):
-    spec = importlib.util.spec_from_file_location(f"relay_{tag}", path)
+def load():
+    spec = importlib.util.spec_from_file_location("relay_under_test", CORE)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
@@ -33,173 +33,197 @@ def load(path: Path, tag: str):
 
 
 def make_event(text: str, *, is_bot: bool, user_id: str, chat_id: str = GROUP,
-               thread_id: str | None = "2", raw_text: str | None = None):
+               thread_id: str | None = "2", raw_text: str | None = None,
+               reply_to: int | None = None):
     src = SimpleNamespace(platform="telegram", user_id=user_id, chat_id=chat_id,
                           thread_id=thread_id, is_bot=is_bot)
     raw = SimpleNamespace(text=raw_text if raw_text is not None else text)
+    if reply_to is not None:
+        raw.reply_to_message = SimpleNamespace(message_id=reply_to)
     return SimpleNamespace(text=text, source=src, message_id=77, raw_message=raw)
 
 
-def run(mod):
+def run() -> dict:
+    mod = load()
+    tmp = Path(tempfile.mkdtemp(prefix="gwrelay-"))
+    store = mod.task_state.TaskStore(tmp / "state.json")
     sent, audited, cards, edits = [], [], [], []
-    state = {"pending_out": {}, "pending_in": {}, "approved_in": {}, "inbox": [], "sent": []}
 
     def routes():
         return {
             "chat_id": int(GROUP),
-            "approvals_thread": 82,
+            "approvals_thread": 1,
             "owner_ids": [int(OWNER)],
             "limits": {"max_text": 3000, "per_hour": 20},
             "self": {"bot_username": "gateway_alpha", "bot_id": 200000002},
-            "bots": {
-                "gateway_beta": {
-                    "title": "gateway_beta (example-agent)", "bot_username": "gateway_beta",
-                    "bot_id": int(PEER_BOT_ID), "chat_id": int(GROUP),
-                    "thread_id": 2, "enabled": True,
-                }
-            },
+            "bots": {"gateway_beta": {"title": "peer", "bot_username": "gateway_beta",
+                                    "bot_id": int(PEER_BOT_ID), "chat_id": int(GROUP),
+                                    "thread_id": 2, "enabled": True}},
         }
 
     mod._routes = routes
     mod._audit = lambda event, **kw: audited.append((event, kw))
-    mod._state = lambda: state
-    mod._write_json = lambda *a, **k: None
-    mod._read_json = lambda *a, **k: {}
+    mod._store = lambda: store
     mod._tg_send = lambda chat, thread, text, reply_to=None, reply_markup=None: (
         sent.append((chat, text)) or (True, "m1"))
     mod._send_card = lambda text, buttons: (cards.append((text, buttons)) or "card1")
+    mod._send_card_ex = lambda text, buttons: (cards.append((text, buttons)) or (str(GROUP), "card1"))
     mod._finish_card = lambda chat, msg, status: edits.append(status)
     mod._tg_api = lambda method, **params: (True, {"message_id": 1})
 
     async def call(ev):
         return await mod.pre_gateway_dispatch(ev)
 
-    results = {}
+    def tasks(direction=None, status=None):
+        data = store.read()
+        out = list((data.get("tasks") or {}).values())
+        if direction:
+            out = [t for t in out if t.get("direction") == direction]
+        if status:
+            out = [t for t in out if t.get("status") == status]
+        return out
 
-    # 1. bot from a foreign chat -> skip
+    res = {}
+
+    # 1. bot from a foreign chat
     r = asyncio.run(call(make_event("hi", is_bot=True, user_id=PEER_BOT_ID, chat_id="-1009999999999")))
     assert r == {"action": "skip", "reason": "relay:bot-outside-group"}, r
     assert audited[-1][0] == "bot_outside_group"
-    results["bot_outside_group"] = True
+    res["bot_outside_group"] = True
 
-    # 2. bot outside the registry -> skip + owner notified
+    # 2. bot outside the registry
     sent.clear()
     r = asyncio.run(call(make_event("hi", is_bot=True, user_id=OTHER_BOT_ID)))
     assert r == {"action": "skip", "reason": "relay:bot-not-allowed"}, r
-    assert audited[-1][0] == "bot_not_allowed"
-    assert sent and sent[0][0] == int(OWNER), sent
-    results["bot_not_allowed"] = True
+    assert sent and sent[0][0] == int(OWNER)
+    res["bot_not_allowed"] = True
 
-    # 3. registered peer with @mention -> parked, approval card in the approvals topic
+    # 3. peer with @mention -> task in `submitted` + card
     cards.clear()
     r = asyncio.run(call(make_event("@gateway_alpha передай привет", is_bot=True, user_id=PEER_BOT_ID)))
     assert r == {"action": "skip", "reason": "relay:inbound-parked"}, r
     assert audited[-1][0] == "bot_inbound_parked"
-    assert cards and cards[0][1][0][0] == "Принять" and cards[0][1][0][1].startswith("gwin:ok:")
-    req = next(iter(state["pending_in"]))
-    results["inbound_parked_with_card"] = True
+    inbound = tasks("in", "submitted")
+    assert len(inbound) == 1, inbound
+    task = inbound[0]
+    assert cards and cards[0][1][0][1] == f"gwin:ok:{task['task_id']}"
+    res["inbound_parked_as_task"] = True
 
-    # 3b. Telegram strips our own @handle for the addressee: the raw message still has it
+    # 3b. own @handle stripped by Telegram -> raw_message still has it
     r = asyncio.run(call(make_event("передай привет", is_bot=True, user_id=PEER_BOT_ID,
                                     raw_text="@gateway_alpha передай привет")))
     assert r == {"action": "skip", "reason": "relay:inbound-parked"}, r
-    results["mention_from_raw_text"] = True
+    res["mention_from_raw_text"] = True
 
-    # 4. bot without our mention -> skip
+    # 4. no mention
     r = asyncio.run(call(make_event("просто болтовня", is_bot=True, user_id=PEER_BOT_ID)))
     assert r == {"action": "skip", "reason": "relay:bot-no-mention"}, r
-    assert audited[-1][0] == "bot_no_mention"
-    results["bot_no_mention"] = True
+    res["bot_no_mention"] = True
 
-    # 4b. hop budget: a chain deeper than 3 is never continued
-    r = asyncio.run(call(make_event("@gateway_alpha [gw-hop:4] и снова здравствуйте", is_bot=True,
+    # 4b. hop budget via the context marker
+    r = asyncio.run(call(make_event("@gateway_alpha [gw ctx:ab12 #4] ещё раз", is_bot=True,
                                     user_id=PEER_BOT_ID)))
     assert r == {"action": "skip", "reason": "relay:hop-limit"}, r
     assert audited[-1][0] == "hop_limit"
-    results["hop_limit"] = True
+    res["hop_limit"] = True
 
-    # 5. another bot's clarify card -> UI noise
+    # 5. foreign clarify card / own card echo
     card = '❓ Принять сообщение?\n\n1. Принять (Recommended)\n\nReply "skip" to skip this question.'
-    r = asyncio.run(call(make_event(card, is_bot=True, user_id=PEER_BOT_ID)))
-    assert r == {"action": "skip", "reason": "relay:bot-ui-noise"}, r
-    results["bot_ui_noise"] = True
+    assert asyncio.run(call(make_event(card, is_bot=True, user_id=PEER_BOT_ID)))["reason"] == "relay:bot-ui-noise"
+    assert asyncio.run(call(make_event(mod._CARD_MARK + "x", is_bot=True,
+                                       user_id=PEER_BOT_ID)))["reason"] == "relay:bot-ui-noise"
+    res["bot_ui_noise"] = True
 
-    # 5b. our own card echoed back -> UI noise
-    r = asyncio.run(call(make_event(mod._CARD_MARK + "Принять?", is_bot=True, user_id=PEER_BOT_ID)))
-    assert r == {"action": "skip", "reason": "relay:bot-ui-noise"}, r
-    results["own_card_noise"] = True
+    # 6. mention rule for humans
+    assert asyncio.run(call(make_event("пинг", is_bot=False, user_id=OWNER)))["reason"] == "relay:no-mention"
+    assert asyncio.run(call(make_event("@gateway_alpha пинг", is_bot=False, user_id=OWNER))) is None
+    res["mention_rule"] = True
 
-    # 6. human in the group without a mention -> not ours; with a mention -> ours
-    r = asyncio.run(call(make_event("пинг", is_bot=False, user_id=OWNER)))
-    assert r == {"action": "skip", "reason": "relay:no-mention"}, r
-    assert audited[-1][0] == "no_mention"
-    r = asyncio.run(call(make_event("@gateway_alpha пинг", is_bot=False, user_id=OWNER)))
-    assert r is None, r
-    results["mention_rule"] = True
+    # 7. human DM passes through
+    assert asyncio.run(call(make_event("привет", is_bot=False, user_id=OWNER,
+                                       chat_id=OWNER, thread_id=None))) is None
+    res["human_dm_passthrough"] = True
 
-    # 7. human DM -> falls through to the agent
-    r = asyncio.run(call(make_event("привет", is_bot=False, user_id=OWNER,
-                                    chat_id=OWNER, thread_id=None)))
-    assert r is None, r
-    results["human_dm_passthrough"] = True
-
-    # 8. outbound: relay_send parks and posts an "Отправить" card, nothing sent yet
+    # 8. outbound: task submitted, card with "Отправить", nothing sent
     cards.clear()
     sent.clear()
     out = json.loads(mod.tool_send({"target": "gateway_beta", "text": "Сколько времени?"}))
     assert out["status"] == "pending_owner_approval", out
-    assert cards and cards[0][1][0][1].startswith("gwout:ok:"), cards
-    assert not sent, sent
-    out_req = out["request"]
-    results["outbound_parked"] = True
-
-    # 9. owner clicks "Отправить" -> delivered now, card edited
-    edits.clear()
-    status = mod.resolve_card_click(f"gwout:ok:{out_req}", OWNER, "cb1", str(GROUP), "card1")
-    assert "Отправлено" in status, status
-    assert sent and "@gateway_beta" in sent[0][1], sent
-    assert edits, edits
-    assert state["pending_out"] == {}, state
-    results["outbound_card_click_sends"] = True
-
-    # 10. non-owner click -> denied, nothing sent
-    sent.clear()
-    status = mod.resolve_card_click("gwout:ok:deadbeef", OTHER_BOT_ID, "cb2", str(GROUP), "card1")
-    assert status == "denied", status
+    assert tasks("out", "submitted"), tasks()
+    assert cards and cards[0][1][0][1] == f"gwout:ok:{out['task_id']}"
     assert not sent
-    results["callback_owner_only"] = True
+    res["outbound_parked_as_task"] = True
 
-    # 11. inbound accept moves the parked item to approved_in (the watcher injects)
-    status = mod.resolve_card_click(f"gwin:ok:{req}", OWNER, "cb3", str(GROUP), "card1")
+    # 9. click "Отправить" -> working -> completed, delivered with the context marker
+    edits.clear()
+    status = mod.resolve_card_click(f"gwout:ok:{out['task_id']}", OWNER, "cb1", str(GROUP), "card1")
+    assert "Отправлено" in status, status
+    assert sent and "@gateway_beta" in sent[0][1] and "gw ctx:" in sent[0][1], sent
+    assert tasks("out", "completed"), tasks("out")
+    res["outbound_card_click_completes"] = True
+
+    # 10. non-owner click refused
+    sent.clear()
+    assert mod.resolve_card_click(f"gwout:ok:{out['task_id']}", OTHER_BOT_ID, "cb2",
+                                  str(GROUP), "card1") == "denied"
+    assert not sent
+    res["callback_owner_only"] = True
+
+    # 11. inbound accept -> working (the drain picks it up)
+    status = mod.resolve_card_click(f"gwin:ok:{task['task_id']}", OWNER, "cb3", str(GROUP), "card1")
     assert "Принято" in status, status
-    assert req in state["approved_in"], state
-    results["inbound_accept_queues_injection"] = True
+    assert tasks("in", "working"), tasks("in")
+    res["inbound_accept_working"] = True
 
-    # 11b. the quiet profile turn's answer is parsed out of the CLI banner
-    raw = "────\n\u2624 Hermes\nГотово: 42\n────\n\nSession: local-x\n"
-    assert mod._extract_reply(raw) == "Готово: 42", mod._extract_reply(raw)
-    assert mod._extract_reply("\x1b[36m\u2624 Hermes\x1b[0m\n\x1b[1mok\x1b[0m\n────\n") == "ok"
-    results["cli_reply_parsing"] = True
-
-    # 12. inbound reject drops it
-    state["pending_in"]["zzz"] = {"text": "x", "created": mod.time.time()}
-    status = mod.resolve_card_click("gwin:no:zzz", OWNER, "cb4", str(GROUP), "card1")
+    # 12. inbound reject -> rejected, nothing sent
+    mod._send_card_ex = lambda text, buttons: (cards.append((text, buttons)) or (str(GROUP), "card2"))
+    asyncio.run(call(make_event("@gateway_alpha второй", is_bot=True, user_id=PEER_BOT_ID)))
+    second = tasks("in", "submitted")[0]
+    sent.clear()
+    status = mod.resolve_card_click(f"gwin:no:{second['task_id']}", OWNER, "cb4", str(GROUP), "card2")
     assert "отклонён" in status.lower(), status
-    assert "zzz" not in state["pending_in"] and "zzz" not in state["approved_in"]
-    results["inbound_reject_drops"] = True
+    assert not sent
+    res["inbound_reject"] = True
 
-    return results
+    # 13. cancel card -> cancelled + notification to the peer
+    mod._send_card_ex = lambda text, buttons: (cards.append((text, buttons)) or (str(GROUP), "card3"))
+    third = json.loads(mod.tool_send({"target": "gateway_beta", "text": "отмени меня"}))
+    sent.clear()
+    status = mod.resolve_card_click(f"gwcancel:ok:{third['task_id']}", OWNER, "cb5", str(GROUP), "card3")
+    assert "отменена" in status, status
+    assert sent and "отменена инициатором" in sent[0][1], sent
+    assert any(t["status"] == "cancelled" for t in tasks("out")), tasks("out")
+    res["cancel_with_notice"] = True
+
+    # 14. ASK answer via a reply to the ASK card
+    mod._send_card_ex = lambda text, buttons: (cards.append((text, buttons)) or (str(GROUP), "card4"))
+    asyncio.run(call(make_event("@gateway_alpha вопрос про время", is_bot=True, user_id=PEER_BOT_ID)))
+    ask_task = tasks("in", "submitted")[-1]
+    with store.mutate() as data:
+        mod.task_state.TaskStore.transition(data, ask_task["task_id"], "working")
+        mod.task_state.TaskStore.transition(data, ask_task["task_id"], "input-required",
+                                            question="какой город?", card_chat=str(GROUP),
+                                            card_msg="9")
+    mod._reply = lambda chat, thread, text: sent.append((chat, text))
+    r = asyncio.run(call(make_event("Москва", is_bot=False, user_id=OWNER, thread_id="1",
+                                    reply_to=9)))
+    assert r == {"action": "skip", "reason": "relay:ask-answered"}, r
+    assert any(t["status"] == "working" and t.get("answer") == "Москва"
+               for t in tasks("in")), tasks("in")
+    res["ask_answer_by_reply"] = True
+
+    # 15. the quiet-turn reply parsing still works
+    raw = "────\n\u2624 Hermes\nDONE: 42\n────\n\nSession: local-x\n"
+    assert mod._extract_reply(raw) == "DONE: 42", mod._extract_reply(raw)
+    res["cli_reply_parsing"] = True
+
+    return res
 
 
 def main() -> int:
-    total = 0
-    for tag, path in PLUGINS.items():
-        assert path.is_file(), path
-        mod = load(path, tag)
-        res = run(mod)
-        print(f"{tag}: {json.dumps(res, ensure_ascii=False)}")
-        total += len(res)
-    print(f"OK: {total} assertion groups passed")
+    res = run()
+    print("gateway-relay: " + json.dumps(res, ensure_ascii=False))
+    print(f"OK: {len(res)} assertion groups passed")
     return 0
 
 

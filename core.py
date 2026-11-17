@@ -25,6 +25,11 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+
+try:  # normal package import (live plugin)
+    from . import state as task_state
+except ImportError:  # loaded by path in tests
+    import state as task_state
 from typing import Any, Dict, Optional, Tuple
 
 CODE_TTL_S = 900           # approval window
@@ -33,6 +38,11 @@ PER_HOUR = 20              # relays per rolling hour
 SSRF_HOST_ALLOW = re.compile(r"^https?://(127\.0\.0\.1|localhost|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)", re.I)
 
 _LOCK = threading.RLock()
+
+# --- approval cards in the approvals topic -----------------------------------
+_CARD_MARK = "\U0001f6e1 gateway \u00b7 "      # every card starts with this marker
+_CARD_TTL_S = task_state.CARD_TTL_S            # the card clock lives in state.py
+_WATCH: dict[str, bool] = {}
 
 # --- leak / injection filters -------------------------------------------------
 _LEAK_PATTERNS: list[tuple[str, str]] = [
@@ -86,6 +96,10 @@ def _home() -> Path:
     return candidates[0] if candidates else Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 
 
+def _store() -> "task_state.TaskStore":
+    return task_state.TaskStore(_state_path())
+
+
 def _routes_path() -> Path:
     return _home() / "gateway-routes.json"
 
@@ -129,10 +143,9 @@ def _routes() -> Dict[str, Any]:
 
 
 def _state() -> Dict[str, Any]:
-    data = _read_json(_state_path(), {})
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("pending", {})
+    """Whole persisted document: tasks + rate-limit stamps + last bot ids."""
+    data = _store().read()
+    data.setdefault("tasks", {})
     data.setdefault("sent", [])
     return data
 
@@ -269,10 +282,10 @@ def tool_routes(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 def tool_send(args: Dict[str, Any], **kwargs: Any) -> str:
-    """Park the relay and ask the OWNER in the approvals topic with inline buttons.
+    """Park the relay as a TASK and ask the OWNER with an inline-button card.
 
-    Nothing is sent from here: the button click is the approval and the callback handler
-    performs the delivery, so neither this model nor a subagent can self-approve.
+    Nothing is sent here: the click moves submitted -> working -> completed
+    (or rejected), and the callback handler performs the delivery.
     """
     target = str(args.get("target") or "").strip().lower()
     text = str(args.get("text") or "").strip()
@@ -290,40 +303,34 @@ def tool_send(args: Dict[str, Any], **kwargs: Any) -> str:
         _audit("refused", target=target, reason=reason, digest=_digest(text), length=len(text))
         return json.dumps({"error": "передача отклонена", "reason": reason}, ensure_ascii=False)
 
-    with _LOCK:
-        st = _state()
-        _prune(st)
+    store = _store()
+    with store.mutate() as state:
         limit = int((data.get("limits") or {}).get("per_hour", PER_HOUR))
-        ok, used = _rate_ok(st, limit)
-        used += len(st.get("pending_out") or {})
+        ok, used = _rate_ok(state, limit)
+        used += len([t for t in (state.get("tasks") or {}).values()
+                     if t.get("direction") == "out" and t.get("status") == "submitted"])
         if not ok or used >= limit:
             _audit("rate_limited", target=target, used=used)
             return json.dumps({"error": f"лимит {limit}/час исчерпан (в очереди и отправлено: {used})"},
                               ensure_ascii=False)
-        req = secrets.token_hex(3)
-        st.setdefault("pending_out", {})[req] = {
-            "target": target, "text": text, "created": time.time(),
-            "chat_id": route.get("chat_id") or data.get("chat_id"),
-            "thread_id": route.get("thread_id"),
-            "bot_username": route.get("bot_username"), "bot_id": route.get("bot_id"),
-        }
-        _write_json(_state_path(), st)
+        task = task_state.TaskStore.create(
+            state, direction="out", peer=target, text=text,
+            chat_id=route.get("chat_id") or data.get("chat_id"),
+            thread_id=route.get("thread_id"))
+        task_id, context_id = task["task_id"], task["context_id"]
 
     title = route.get("title") or target
     preview = text.replace("\n", " ")[:300]
-    mid = _send_card(f"Переслать боту {title}?\n\n{preview}",
-                     [("Отправить", f"gwout:ok:{req}"), ("Отклонить", f"gwout:no:{req}")])
-    _audit("card_sent", req=req, target=target, card=mid, digest=_digest(text), length=len(text))
+    mid = _send_card(f"Переслать боту {title}?\n\n{preview}\n\n· задача {task_id} · ctx {context_id}",
+                     [("Отправить", f"gwout:ok:{task_id}"),
+                      ("Отклонить", f"gwout:no:{task_id}")])
+    _audit("card_sent", task=task_id, ctx=context_id, target=target, card=mid,
+           digest=_digest(text), length=len(text))
     if not mid:
         return json.dumps({"error": "не удалось отправить карточку владельцу"}, ensure_ascii=False)
-    return json.dumps({"status": "pending_owner_approval", "request": req,
-                       "card_message_id": mid, "expires_in_s": _CARD_TTL_S}, ensure_ascii=False)
-
-
-# --- approval cards in the dedicated topic -----------------------------------
-_CARD_MARK = "\U0001f6e1 gateway \u00b7 "      # every card starts with this marker
-_CARD_TTL_S = 1200                             # parked card lives 20 minutes
-_WATCH: dict[str, bool] = {}
+    return json.dumps({"status": "pending_owner_approval", "task_id": task_id,
+                       "context_id": context_id, "card_message_id": mid,
+                       "expires_in_s": task_state.CARD_TTL_S}, ensure_ascii=False)
 
 
 def _tg_api(method: str, **params: Any) -> Tuple[bool, Any]:
@@ -353,15 +360,22 @@ def _tg_api(method: str, **params: Any) -> Tuple[bool, Any]:
         return False, f"telegram api failed: {exc}"
 
 
-def _send_card(text: str, buttons: list) -> str:
+def _send_card_ex(text: str, buttons: list):
+    """(chat_id, message_id) карточки; ("", "") если не отправилась."""
+    return _send_card(text, buttons, _with_coords=True)
+
+
+def _send_card(text: str, buttons: list, _with_coords: bool = False):
     """Post an approval card: the approvals topic of the relay group, else the owner DM.
 
     Telegram has no ``message_thread_id`` for the General topic (the API answers
     "message thread not found"), so 0/1/"general" means "post to the group itself".
     """
     data = _routes()
-    chat = data.get("chat_id")
-    thread = data.get("approvals_thread")
+    # approvals_chat = DM с владельцем (опция 0.2); иначе — топик группы
+    dm_chat = data.get("approvals_chat")
+    chat = dm_chat or data.get("chat_id")
+    thread = None if dm_chat else data.get("approvals_thread")
     if str(thread).strip().lower() in ("0", "1", "general", "none", ""):
         thread = None
     keyboard = {"inline_keyboard": [[
@@ -370,13 +384,15 @@ def _send_card(text: str, buttons: list) -> str:
                       text=_CARD_MARK + text, reply_markup=keyboard,
                       disable_web_page_preview=True)
     if ok and isinstance(res, dict):
-        return str(res.get("message_id") or "")
+        mid = str(res.get("message_id") or "")
+        return (str(chat), mid) if _with_coords else mid
     for owner in (data.get("owner_ids") or []):
         ok, res = _tg_api("sendMessage", chat_id=owner, text=_CARD_MARK + text,
                           reply_markup=keyboard, disable_web_page_preview=True)
         if ok and isinstance(res, dict):
-            return str(res.get("message_id") or "")
-    return ""
+            mid = str(res.get("message_id") or "")
+            return (str(owner), mid) if _with_coords else mid
+    return ("", "") if _with_coords else ""
 
 
 def _finish_card(card_chat: str, card_msg: str, status: str) -> None:
@@ -403,52 +419,74 @@ def resolve_card_click(payload: str, uid: str, cbq_id: str, card_chat: str, card
         _audit("card_unauthorized", user_id=uid, digest=_digest(payload))
         return "denied"
     try:
-        kind, verdict, req = payload.split(":")
+        kind, verdict, task_id = payload.split(":")
     except ValueError:
         _tg_api("answerCallbackQuery", callback_query_id=cbq_id, text="Непонятная карточка")
         return "bad"
     _tg_api("answerCallbackQuery", callback_query_id=cbq_id, text="Принято")
-    status = ""
 
+    store = _store()
+    status = ""
     if kind == "gwout":
-        with _LOCK:
-            st = _state()
-            _prune(st)
-            item = (st.get("pending_out") or {}).pop(req, None)
-            if item is not None and verdict == "ok":
-                st.setdefault("sent", []).append(time.time())
-            _write_json(_state_path(), st)
-        if item is None:
-            status = "\u231b\ufe0f Карточка устарела — запросите заново."
-        elif verdict != "ok":
-            status = "\u274c Отклонено."
-            _audit("card_rejected", req=req, target=item.get("target"))
-        else:
-            route = (data.get("bots") or {}).get(item.get("target")) or {}
-            st = _state()
-            last = (st.get("last_bot_msg") or {}).get(str(route.get("bot_id") or ""), {})
+        task = None
+        with store.mutate() as state:
+            task = task_state.TaskStore.get(state, task_id)
+            if task is None or task_state.TaskStore.is_terminal(task):
+                status = "\u231b\ufe0f Задача неактивна — запросите заново."
+            elif verdict != "ok":
+                task_state.TaskStore.transition(state, task_id, "rejected")
+                status = "\u274c Отклонено."
+                _audit("card_rejected", task=task_id, peer=task.get("peer"))
+            else:
+                task_state.TaskStore.transition(state, task_id, "working")
+        if not status:
+            route = (data.get("bots") or {}).get(task.get("peer") or "") or {}
+            last = (_state().get("last_bot_msg") or {}).get(str(route.get("bot_id") or ""), {})
             mention = f"@{route['bot_username']} " if route.get("bot_username") else ""
-            ok, info = _tg_send(item.get("chat_id") or data.get("chat_id"), item.get("thread_id"),
-                                mention + str(item.get("text") or ""), last.get("message_id"))
-            _audit("card_sent", req=req, target=item.get("target"), ok=bool(ok), message_id=str(info))
-            status = (f"\u2705 Отправлено → {item.get('target')} (msg {info})" if ok
+            ok, info = _tg_send(task.get("chat_id") or data.get("chat_id"), task.get("thread_id"),
+                                f"[gw ctx:{task.get('context_id')} #1] " + mention + str(task.get("text") or ""),
+                                last.get("message_id"))
+            with store.mutate() as state:
+                task_state.TaskStore.transition(state, task_id, "completed" if ok else "failed",
+                                                last_error=None if ok else str(info)[:200])
+                if ok:
+                    state.setdefault("sent", []).append(time.time())
+            _audit("card_sent", task=task_id, peer=task.get("peer"), ok=bool(ok), message_id=str(info))
+            status = (f"\u2705 Отправлено → {task.get('peer')} (msg {info})" if ok
                       else f"\u274c Не доставлено: {info}")
     elif kind == "gwin":
-        with _LOCK:
-            st = _state()
-            _prune(st)
-            item = (st.get("pending_in") or {}).pop(req, None)
-            if item is not None and verdict == "ok":
-                st.setdefault("approved_in", {})[req] = item
-            _write_json(_state_path(), st)
-        if item is None:
-            status = "\u231b\ufe0f Карточка устарела."
-        elif verdict != "ok":
-            status = "\u274c Приём отклонён."
-            _audit("inbound_rejected", req=req, from_bot=item.get("from_bot"))
-        else:
-            status = f"\u2705 Принято от @{item.get('from_bot')} — передаю в работу."
-            _audit("inbound_approved", req=req, from_bot=item.get("from_bot"))
+        with store.mutate() as state:
+            task = task_state.TaskStore.get(state, task_id)
+            if task is None or task_state.TaskStore.is_terminal(task):
+                status = "\u231b\ufe0f Задача неактивна."
+            elif verdict != "ok":
+                task_state.TaskStore.transition(state, task_id, "rejected")
+                status = "\u274c Приём отклонён."
+                _audit("inbound_rejected", task=task_id, peer=task.get("peer"))
+            else:
+                task_state.TaskStore.transition(state, task_id, "working")
+                status = f"\u2705 Принято от @{task.get('peer')} — передаю в работу."
+                _audit("inbound_approved", task=task_id, peer=task.get("peer"))
+    elif kind == "gwcancel":
+        cancelled = False
+        task = None
+        with store.mutate() as state:
+            task = task_state.TaskStore.get(state, task_id)
+            if task is None or task_state.TaskStore.is_terminal(task):
+                status = "\u231b\ufe0f Задача уже завершена."
+            elif verdict != "ok":
+                status = "\u21a9\ufe0f Отмена не нужна, задача остаётся."
+            else:
+                task_state.TaskStore.transition(state, task_id, "cancelled")
+                cancelled = True
+        if cancelled:
+            route = (data.get("bots") or {}).get(task.get("peer") or "") or {}
+            mention = f"@{route['bot_username']} " if route.get("bot_username") else ""
+            _tg_send(task.get("chat_id") or data.get("chat_id"), task.get("thread_id"),
+                     f"[gw ctx:{task.get('context_id')} #cancel] {mention}"
+                     f"\u21a9\ufe0f задача {task.get('peer')} отменена инициатором.", None)
+            status = f"\u21a9\ufe0f Задача {task_id} отменена; уведомление отправлено."
+            _audit("task_cancelled", task=task_id, peer=task.get("peer"))
     else:
         status = "\u2753 Неизвестная карточка."
 
@@ -489,56 +527,65 @@ def _run_profile_turn(body: str) -> str:
 
 
 def drain_approved_in(ctx: Any = None) -> int:
-    """Owner-approved inbound -> one quiet turn of this profile -> reply to the peer."""
-    with _LOCK:
-        st = _state()
-        _prune(st)
-        items = dict(st.get("approved_in") or {})
+    """Approved inbound tasks -> one quiet turn of this profile -> DONE / ASK / SKIP."""
+    store = _store()
+    with store.mutate() as state:
+        store.expire(state)
+        working = [dict(t) for t in (state.get("tasks") or {}).values()
+                   if t.get("direction") == "in" and t.get("status") == "working"]
     done = 0
-    for req, item in items.items():
+    for item in working:
+        task_id = item["task_id"]
         text = str(item.get("text") or "")
-        peer = str(item.get("from_bot") or "")
-        hop_match = re.search(r"\[gw-hop:(\d+)\]", text)
-        hop = int(hop_match.group(1)) if hop_match else 1
+        peer = str(item.get("peer") or "")
+        hop = int(item.get("hops") or 1)
         body = ("[СЛУЖЕБНЫЙ РЕЖИМ gateway: интерактивного канала нет, clarify НЕДОСТУПЕН. "
-                "Это сообщение уже принято владельцем через карточку — подтверждать приём не нужно. "
-                "Если в сообщении нет вопроса или просьбы (статус, отчёт, подтверждение, болтовня) — "
-                "ответь РОВНО одним словом: SKIP. Иначе — короткий ответ по существу, без "
-                f"мета-рассуждений.] [gw-hop:{hop}] {text}")
+                "Сообщение уже принято владельцем через карточку. Ответь РОВНО одной строкой: "
+                "`DONE: <ответ пиру>` если нужен ответ; `ASK: <вопрос владельцу>` если без ответа "
+                "владельца не обойтись; `SKIP` если в сообщении нет вопроса или просьбы.] "
+                f"[gw ctx:{item.get('context_id')} #{hop}] {text}")
+        if item.get("answer"):
+            body += f"\n[ответ владельца на вопрос «{item.get('question') or ''}»] {item['answer']}"
         reply = _run_profile_turn(body)
         if not reply:
-            _audit("inbound_turn_failed", req=req, reason="empty reply")
+            _audit("task_turn_failed", task=task_id)
             continue
-        if reply.strip().upper().startswith("SKIP"):
-            _audit("inbound_skipped", req=req, hop=hop)
-            with _LOCK:
-                st = _state()
-                st.get("approved_in", {}).pop(req, None)
-                _write_json(_state_path(), st)
+        upper = reply.strip().upper()
+        if upper.startswith("SKIP"):
+            with store.mutate() as state:
+                task_state.TaskStore.transition(state, task_id, "skipped")
+            _audit("inbound_skipped", task=task_id, hop=hop)
             continue
-        _low = reply.lower()
-        if any(m in _low for m in ("карточка не доставлена", "undelivered", "подтверждения нет")):
-            _audit("inbound_meta_dropped", req=req, hop=hop)
-            with _LOCK:
-                st = _state()
-                st.get("approved_in", {}).pop(req, None)
-                _write_json(_state_path(), st)
+        if upper.startswith("ASK:"):
+            question = reply.strip()[4:].strip()[:1500]
+            card_chat, card_msg = _send_card_ex(
+                f"Нужен ответ пиру @{peer}.\n\n{question}\n\n"
+                f"Ответьте реплаем на это сообщение.\n\n· задача {task_id}",
+                [("Жду ответа", f"gwin:no:{task_id}")])
+            with store.mutate() as state:
+                task_state.TaskStore.transition(state, task_id, "input-required",
+                                                question=question, card_chat=card_chat,
+                                                card_msg=card_msg)
+            _audit("task_input_required", task=task_id, peer=peer)
             continue
+        payload = reply.strip()
+        if payload.upper().startswith("DONE:"):
+            payload = payload[5:].strip()
         mention = f"@{peer} " if peer else ""
         ok, info = _tg_send(item.get("chat_id"), item.get("thread_id"),
-                            f"[gw-hop:{hop + 1}] {mention}{reply}", item.get("message_id"))
-        _audit("inbound_answered", req=req, ok=bool(ok), message_id=str(info))
-        if not ok:
-            continue
-        with _LOCK:
-            st = _state()
-            st.get("approved_in", {}).pop(req, None)
-            st.setdefault("inbox", []).append({
-                "req": req, "from_bot": peer, "text": text[:2000], "reply": reply[:2000],
-                "thread_id": item.get("thread_id"), "ts": time.time(), "read": False})
-            st["inbox"] = st["inbox"][-30:]
-            _write_json(_state_path(), st)
-        done += 1
+                            f"[gw ctx:{item.get('context_id')} #{hop + 1}] {mention}{payload}",
+                            item.get("message_id"))
+        with store.mutate() as state:
+            task_state.TaskStore.transition(state, task_id, "completed" if ok else "failed",
+                                            last_error=None if ok else str(info)[:200])
+            if ok:
+                state.setdefault("inbox", []).append({
+                    "task": task_id, "peer": peer, "text": text[:2000], "reply": payload[:2000],
+                    "thread_id": item.get("thread_id"), "ts": time.time(), "read": False})
+                state["inbox"] = state["inbox"][-30:]
+        _audit("inbound_answered" if ok else "inbound_answer_failed", task=task_id, peer=peer,
+               ok=bool(ok), message_id=str(info))
+        done += 1 if ok else 0
     return done
 
 
@@ -597,6 +644,29 @@ def tool_inbox(args: Dict[str, Any], **kwargs: Any) -> str:
 _UI_NOISE = ('Reply "skip" to skip this question',)
 
 
+def tool_cancel(args: Dict[str, Any], **kwargs: Any) -> str:
+    """Ask the owner to cancel an already submitted task (initiator only)."""
+    task_id = str(args.get("task_id") or "").strip()
+    store = _store()
+    with store.mutate() as state:
+        task = task_state.TaskStore.get(state, task_id)
+        if task is None:
+            return json.dumps({"error": "задача не найдена"}, ensure_ascii=False)
+        if task.get("direction") != "out":
+            return json.dumps({"error": "отменять можно только свои задачи"}, ensure_ascii=False)
+        if task_state.TaskStore.is_terminal(task):
+            return json.dumps({"error": f"задача уже в статусе {task.get('status')}"},
+                              ensure_ascii=False)
+        peer, text = task.get("peer"), str(task.get("text") or "")[:200]
+    mid = _send_card(f"Отменить задачу {task_id} для {peer}?\n\n{text}",
+                     [("Отменить", f"gwcancel:ok:{task_id}"),
+                      ("Оставить", f"gwcancel:no:{task_id}")])
+    _audit("cancel_card_sent", task=task_id, peer=peer, card=mid)
+    if not mid:
+        return json.dumps({"error": "не удалось отправить карточку"}, ensure_ascii=False)
+    return json.dumps({"status": "cancel_pending", "task_id": task_id}, ensure_ascii=False)
+
+
 def _is_bot_ui_noise(text: str) -> bool:
     """True for an actual clarify/approval card echoed into the relay group.
 
@@ -619,8 +689,6 @@ def _clarify_pending() -> bool:
 
 
 # --- gateway hook -------------------------------------------------------------
-_ROUTE_RE = re.compile(r"^/?ROUTE\s+(DEL\s+)?(\S+)(?:\s+(\d+))?(?:\s+(.+))?$", re.I)
-_TOPIC_LINK_RE = re.compile(r"t\.me/(?:c/\d+|[A-Za-z0-9_]+)/(\d+)", re.I)
 
 
 def _reply(chat_id: Any, thread_id: Any, text: str) -> None:
@@ -652,18 +720,20 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
         _raw_text = str(getattr(_raw, "text", None) or getattr(_raw, "caption", None) or "")
         _mentions_self = bool(_self_name) and ("@" + _self_name).lower() in (text + " " + _raw_text).lower()
         _in_group = str(chat_id) == str(data.get("chat_id"))
+        _raw_msg = getattr(event, "raw_message", None)
+        _reply_id = getattr(getattr(_raw_msg, "reply_to_message", None), "message_id", None)
         if (not getattr(src, "is_bot", False) and _in_group and text
                 and not _mentions_self and not _clarify_pending()
-                and not text.startswith("/")
-                and not text.lstrip("/").upper().startswith("ROUTE ")):
+                and not _reply_id
+                and not text.startswith("/")):
             _audit("no_mention", user_id=uid, thread_id=thread_id,
                    digest=_digest(text), length=len(text))
             return {"action": "skip", "reason": "relay:no-mention"}
 
         if getattr(src, "is_bot", False):
             # Bot-authored inbound: only from this group, only from bots in the registry,
-            # and only with an explicit @mention. The text never reaches the model until the
-            # OWNER approves the card in the approvals topic.
+            # and only with an explicit @mention. It becomes a TASK and never reaches the
+            # model before the owner approves the card.
             if str(chat_id) != str(data.get("chat_id")):
                 _audit("bot_outside_group", user_id=uid, chat_id=chat_id)
                 return {"action": "skip", "reason": "relay:bot-outside-group"}
@@ -687,75 +757,64 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
                 _audit("bot_no_mention", user_id=uid, thread_id=thread_id,
                        digest=_digest(text), length=len(text))
                 return {"action": "skip", "reason": "relay:bot-no-mention"}
-            _hop_match = re.search(r"\[gw-hop:(\d+)\]", text)
-            _hop = int(_hop_match.group(1)) if _hop_match else 1
+            _ctx_match = re.search(r"\[gw ctx:(\w+)(?: #(\d+))?\]", text)
+            _hop = int(_ctx_match.group(2)) if (_ctx_match and _ctx_match.group(2)) else 1
             if _hop > 3:
                 _audit("hop_limit", user_id=uid, thread_id=thread_id, hop=_hop)
                 return {"action": "skip", "reason": "relay:hop-limit"}
-            with _LOCK:
-                st = _state()
-                _prune(st)
-                st.setdefault("last_bot_msg", {})[uid] = {
+            store = _store()
+            with store.mutate() as state:
+                store.expire(state)
+                state.setdefault("last_bot_msg", {})[uid] = {
                     "message_id": getattr(event, "message_id", None),
                     "chat_id": chat_id, "thread_id": thread_id, "ts": time.time()}
-                req = secrets.token_hex(3)
-                st.setdefault("pending_in", {})[req] = {
-                    "text": text, "chat_id": chat_id, "thread_id": thread_id,
-                    "message_id": getattr(event, "message_id", None),
-                    "from_bot": peer.get("bot_username") or uid, "bot_id": uid,
-                    "owner_id": (data.get("owner_ids") or [None])[0],
-                    "created": time.time()}
-                _write_json(_state_path(), st)
-            _audit("bot_inbound_parked", user_id=uid, thread_id=thread_id, req=req,
-                   digest=_digest(text), length=len(text))
+                task = task_state.TaskStore.create(
+                    state, direction="in", peer=peer.get("bot_username") or uid, text=text,
+                    chat_id=chat_id, thread_id=thread_id,
+                    message_id=getattr(event, "message_id", None),
+                    context_id=(_ctx_match.group(1) if _ctx_match else None), hops=_hop)
+                task_id, context_id = task["task_id"], task["context_id"]
+            _audit("bot_inbound_parked", user_id=uid, thread_id=thread_id, task=task_id,
+                   ctx=context_id, hop=_hop, digest=_digest(text), length=len(text))
             name = str(peer.get("bot_username") or peer.get("title") or uid)
             preview = text.replace("\n", " ")[:300]
-            _send_card(f"Принять сообщение от @{name}?\n\n{preview}",
-                       [("Принять", f"gwin:ok:{req}"), ("Отклонить", f"gwin:no:{req}")])
+            card_chat, card_msg = _send_card_ex(
+                f"Принять сообщение от @{name}?\n\n{preview}\n\n· задача {task_id} · ctx {context_id}",
+                [("Принять", f"gwin:ok:{task_id}"), ("Отклонить", f"gwin:no:{task_id}")])
+            if card_msg:
+                with store.mutate() as state:
+                    got = task_state.TaskStore.get(state, task_id)
+                    if got is not None:
+                        got["card_chat"], got["card_msg"] = card_chat, card_msg
             return {"action": "skip", "reason": "relay:inbound-parked"}
 
         if uid not in owner_ids:
             # Unauthorized sender: let core auth/pairing handle it, but log the attempt
             # when it looks like an approval (probing / privilege escalation attempt).
-            if text.lstrip("/").upper().startswith("ROUTE "):
+            if text.lstrip("/").upper().startswith("/"):
                 _audit("unauthorized_control_attempt", user_id=uid, chat_id=chat_id,
                        text_digest=_digest(text))
             return None
 
-        m = _ROUTE_RE.match(text)
-        if m:
-            delete, name, thread, title = m.group(1), m.group(2), m.group(3), m.group(4)
-            if thread is None and title:
-                # accept a topic link instead of a bare id: t.me/c/<chat>/<thread>
-                lm = _TOPIC_LINK_RE.search(title)
-                if lm:
-                    thread = lm.group(1)
-                    before = re.sub(r"https?://\s*$", "", title[:lm.start()]).strip()
-                    title = before or None
-            name = name.lower()
-            with _LOCK:
-                data = _routes()
-                if delete:
-                    data["bots"].pop(name, None)
-                    _write_json(_routes_path(), data)
-                    _reply(chat_id, thread_id, f"Маршрут {name} удалён.")
-                    _audit("route_deleted", name=name, user_id=uid)
-                elif thread:
-                    data["bots"][name] = {
-                        "title": title or name,
-                        "thread_id": int(thread),
-                        "chat_id": data.get("chat_id"),
-                        "transport": "telegram",
-                        "enabled": True,
-                    }
-                    _write_json(_routes_path(), data)
-                    _reply(chat_id, thread_id, f"Маршрут {name} → топик {thread} сохранён.")
-                    _audit("route_added", name=name, thread_id=thread, user_id=uid)
-                else:
-                    listing = "\n".join(f"• {k} → топик {v.get('thread_id')} ({v.get('title')})"
-                                        for k, v in data["bots"].items()) or "пусто"
-                    _reply(chat_id, thread_id, "Маршруты:\n" + listing)
-            return {"action": "skip", "reason": "relay:route-admin"}
+        # Owner answers an ASK card by replying to it in the approvals chat.
+        if uid in owner_ids and text:
+            replied = _reply_id
+            if replied:
+                store = _store()
+                hit_task = None
+                with store.mutate() as state:
+                    for task in (state.get("tasks") or {}).values():
+                        if (str(task.get("card_msg") or "") == str(replied)
+                                and str(task.get("card_chat") or "") == str(chat_id)
+                                and task.get("status") == "input-required"):
+                            task_state.TaskStore.transition(state, task["task_id"], "working",
+                                                            answer=text)
+                            hit_task = task["task_id"]
+                            break
+                if hit_task:
+                    _audit("ask_answered", task=hit_task, length=len(text))
+                    _reply(chat_id, thread_id, "✅ Ответ принят — передаю пиру.")
+                    return {"action": "skip", "reason": "relay:ask-answered"}
     except Exception as exc:  # never break the gateway
         _audit("hook_error", error=str(exc)[:300])
     return None
