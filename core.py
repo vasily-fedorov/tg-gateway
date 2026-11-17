@@ -354,10 +354,16 @@ def _tg_api(method: str, **params: Any) -> Tuple[bool, Any]:
 
 
 def _send_card(text: str, buttons: list) -> str:
-    """Post an approval card: the approvals topic of the relay group, else the owner DM."""
+    """Post an approval card: the approvals topic of the relay group, else the owner DM.
+
+    Telegram has no ``message_thread_id`` for the General topic (the API answers
+    "message thread not found"), so 0/1/"general" means "post to the group itself".
+    """
     data = _routes()
     chat = data.get("chat_id")
     thread = data.get("approvals_thread")
+    if str(thread).strip().lower() in ("0", "1", "general", "none", ""):
+        thread = None
     keyboard = {"inline_keyboard": [[
         {"text": label, "callback_data": payload} for label, payload in buttons]]}
     ok, res = _tg_api("sendMessage", chat_id=chat, message_thread_id=thread,
