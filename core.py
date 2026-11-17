@@ -784,6 +784,11 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
                 _audit("bot_ui_noise", user_id=uid, thread_id=thread_id,
                        digest=_digest(text), length=len(text))
                 return {"action": "skip", "reason": "relay:bot-ui-noise"}
+            if "#cancel]" in text:
+                # Служебное уведомление об отмене: не задача, карточку владельцу не рисуем.
+                _audit("cancel_notice", user_id=uid, thread_id=thread_id,
+                       digest=_digest(text), length=len(text))
+                return {"action": "skip", "reason": "relay:cancel-notice"}
             if _self_name and not _mentions_self:
                 _audit("bot_no_mention", user_id=uid, thread_id=thread_id,
                        digest=_digest(text), length=len(text))

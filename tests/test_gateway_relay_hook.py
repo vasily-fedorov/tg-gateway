@@ -115,6 +115,15 @@ def run() -> dict:
     assert r == {"action": "skip", "reason": "relay:inbound-parked"}, r
     res["mention_from_raw_text"] = True
 
+    # 3c. cancel notice from a peer -> no task, no card
+    cards.clear()
+    r = asyncio.run(call(make_event("@gateway_alpha [gw ctx:ab12 #cancel] ↩️ задача отменена",
+                                    is_bot=True, user_id=PEER_BOT_ID)))
+    assert r == {"action": "skip", "reason": "relay:cancel-notice"}, r
+    assert audited[-1][0] == "cancel_notice"
+    assert not cards, cards
+    res["cancel_notice_skipped"] = True
+
     # 4. no mention
     r = asyncio.run(call(make_event("просто болтовня", is_bot=True, user_id=PEER_BOT_ID)))
     assert r == {"action": "skip", "reason": "relay:bot-no-mention"}, r
