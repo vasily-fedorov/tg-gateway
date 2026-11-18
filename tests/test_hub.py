@@ -376,6 +376,31 @@ def run() -> dict:
     assert bad["error"]["code"] == -32601, bad
     res["rpc_tasks_get_cancel"] = True
 
+    # tasks/update: агент сообщает итог в A2A-виде
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.db.set_route(OWNER, "god", "aa", policy="auto")
+    hub.db.set_route(OWNER, "aa", "god", policy="auto")
+    hub.handle(msg(GOD, json.dumps({"jsonrpc": "2.0", "id": "s1", "method": "message/send",
+                                    "params": {"message": {"role": "user", "messageId": "u-1",
+                                                           "parts": [{"kind": "text",
+                                                                      "text": "вопрос"}]},
+                                               "to": "aa"}}), is_bot=True, username="god"))
+    tv = json.loads(tg.sent[-1]["text"])["result"]["task"]
+    hub.handle(cb(OWNER, f"hub:ok:{tv['id']}"))
+    upd = json.loads(tg.sent[-1]["text"]) if False else None
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "s2", "method": "tasks/update",
+                                   "params": {"task": tv["id"],
+                                              "status": {"state": "completed"},
+                                              "artifact": {"parts": [{"kind": "text",
+                                                                      "text": "ответ 42"}]}}}),
+                   is_bot=True, username="aa"))
+    back = json.loads(tg.sent[-1]["text"])
+    assert back["result"]["task"]["status"]["state"] in ("working", "completed"), back
+    assert any(e.get("text") == "ответ 42" for e in envelopes(tg, GOD)), envelopes(tg, GOD)
+    res["rpc_tasks_update"] = True
+
     # legacy-конверт продолжает работать
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),
                    is_bot=True, username="god"))

@@ -131,6 +131,30 @@ def _to_hub(text: str) -> bool:
     return bool(ok)
 
 
+def _hub_rpc(method: str, params: Dict[str, Any], *, timeout: float = 8.0) -> Dict[str, Any]:
+    """JSON-RPC вызов хаба по Telegram: отправляем запрос и ждём ответ в state["rpc"].
+
+    Хук этого же процесса принимает ответ от хаба и складывает его в state, поэтому
+    ожидание — короткий поллинг файла состояния, без сети и без блокировки модели.
+    """
+    hub = _hub_cfg()
+    if not hub:
+        return {"error": "профиль не в endpoint-режиме"}
+    rpc_id = "r-" + secrets.token_hex(4)
+    payload = {"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params}
+    if not _to_hub(json.dumps(payload, ensure_ascii=False)):
+        return {"error": "хаб недоступен"}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        got = (_store().read().get("rpc") or {}).get(rpc_id)
+        if isinstance(got, dict):
+            if "result" in got:
+                return got["result"] if isinstance(got["result"], dict) else {"result": got["result"]}
+            return {"error": (got.get("error") or {}).get("message", "ошибка хаба")}
+        time.sleep(0.4)
+    return {"error": "хаб не ответил вовремя"}
+
+
 def _state_path() -> Path:
     return _home() / "gateway-relay-state.json"
 
@@ -594,6 +618,27 @@ def _ask_own_default(question: str) -> str:
     return ""
 
 
+def _a2a_update(item: Dict[str, Any], verdict: str, *, text: str = "") -> bool:
+    """A2A-апдейт задачи в хаб: status.state + message/artifact."""
+    state = {"done": "completed", "ask": "input-required", "skip": "completed"}[verdict]
+    params: Dict[str, Any] = {
+        "task": item.get("hub_task") or "",
+        "contextId": item.get("context_id") or "",
+        "status": {"state": state, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+    }
+    if verdict == "ask":
+        params["status"]["message"] = {"role": "agent", "parts": [{"kind": "text", "text": text}]}
+    elif verdict == "done":
+        params["artifact"] = {"artifactId": (item.get("hub_task") or "a") + "-out",
+                              "parts": [{"kind": "text", "text": text}]}
+    else:
+        params["metadata"] = {"skipped": True}
+    payload = {"jsonrpc": "2.0", "id": "u-" + secrets.token_hex(4),
+               "method": "tasks/update", "params": params}
+    _audit("rpc_tasks_update", task=params["task"], verdict=verdict, length=len(text))
+    return _to_hub(json.dumps(payload, ensure_ascii=False))
+
+
 def drain_approved_in(ctx: Any = None) -> int:
     """Approved inbound tasks -> one quiet turn of this profile -> DONE / ASK / SKIP."""
     store = _store()
@@ -626,8 +671,7 @@ def drain_approved_in(ctx: Any = None) -> int:
             with store.mutate() as state:
                 task_state.TaskStore.transition(state, task_id, "skipped")
             if _hub_cfg():
-                _to_hub(json.dumps({"t": "reply", "task": item.get("hub_task") or "",
-                                    "verdict": "skip"}, ensure_ascii=False))
+                _a2a_update(item, "skip")
             _audit("inbound_skipped", task=task_id, hop=hop)
             continue
         if upper.startswith("ASK:"):
@@ -652,18 +696,14 @@ def drain_approved_in(ctx: Any = None) -> int:
                                                     question=question, card_chat=card_chat,
                                                     card_msg=card_msg)
                 if _hub_cfg():
-                    _to_hub(json.dumps({"t": "reply", "task": item.get("hub_task") or "",
-                                        "verdict": "ask", "question": question},
-                                       ensure_ascii=False))
+                    _a2a_update(item, "ask", text=question)
                 _audit("task_input_required", task=task_id, peer=peer)
                 continue
         payload = reply.strip()
         if payload.upper().startswith("DONE:"):
             payload = payload[5:].strip()
         if _hub_cfg():
-            ok = _to_hub(json.dumps({"t": "reply", "task": item.get("hub_task") or "",
-                                     "verdict": "done", "text": payload},
-                                    ensure_ascii=False))
+            ok = _a2a_update(item, "done", text=payload)
             info = "hub"
         else:
             mention = f"@{peer} " if peer else ""
@@ -763,6 +803,16 @@ def tool_cancel(args: Dict[str, Any], **kwargs: Any) -> str:
     if not mid:
         return json.dumps({"error": "не удалось отправить карточку"}, ensure_ascii=False)
     return json.dumps({"status": "cancel_pending", "task_id": task_id}, ensure_ascii=False)
+
+
+def tool_status(args: Dict[str, Any], **kwargs: Any) -> str:
+    """Статус задачи у хаба (A2A tasks/get)."""
+    task_id = str(args.get("task_id") or "").strip()
+    if not task_id:
+        return json.dumps({"error": "нужен task_id"}, ensure_ascii=False)
+    res = _hub_rpc("tasks/get", {"id": task_id})
+    _audit("rpc_tasks_get", task=task_id, ok="error" not in res)
+    return json.dumps(res, ensure_ascii=False)
 
 
 def _is_bot_ui_noise(text: str) -> bool:

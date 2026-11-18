@@ -332,6 +332,40 @@ class Hub:
                 self.db.remember_message(message_id, task["task_id"])
             return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task)}))
 
+        if method in ("tasks/update", "tasks/status"):
+            task_id = str(params.get("task") or params.get("id") or "")
+            task = self.db.task(task_id)
+            if not task or int(task["owner_tg"]) != owner:
+                return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_FOUND,
+                                                    "задача не найдена"))
+            status = params.get("status") or {}
+            state = str(status.get("state") or "")
+            text = ""
+            artifact = params.get("artifact") or {}
+            for part in (artifact.get("parts") or []):
+                if str(part.get("kind") or "text") == "text":
+                    text += str(part.get("text") or "")
+            message = status.get("message") or {}
+            if not text:
+                for part in (message.get("parts") or []):
+                    if str(part.get("kind") or "text") == "text":
+                        text += str(part.get("text") or "")
+            text = text.strip()
+            if state == "input-required":
+                verdict, question = "ask", text
+            elif state == "failed":
+                self.db.update_task(task_id, status="failed")
+                self.db.event("task_failed", task_id=task_id, owner=owner, via="rpc")
+                return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task)}))
+            elif text:
+                verdict, question = "done", ""
+            else:
+                verdict, question = "skip", ""
+            self.on_reply(bot, {"t": "reply", "task": task_id, "verdict": verdict,
+                                "text": text, "question": question})
+            fresh = self.db.task(task_id)
+            return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(fresh)}))
+
         if method == "tasks/get":
             task = self.db.task(str(params.get("id") or ""))
             if not task or int(task["owner_tg"]) != owner:

@@ -29,6 +29,17 @@ _SEND_SCHEMA = {
     },
 }
 
+_STATUS_SCHEMA = {
+    "name": "relay_status",
+    "description": ("Статус задачи в хабе (A2A tasks/get): состояние, вопрос, артефакт. "
+                    "Работает только в endpoint-режиме."),
+    "parameters": {
+        "type": "object",
+        "properties": {"task_id": {"type": "string", "description": "task_id от relay_send"}},
+        "required": ["task_id"],
+    },
+}
+
 _CANCEL_SCHEMA = {
     "name": "relay_cancel",
     "description": (
@@ -108,6 +119,9 @@ def register(ctx) -> None:
     ctx.register_tool(name="relay_send", toolset="gateway_relay",
                       schema=_SEND_SCHEMA, handler=core.tool_send,
                       description="Relay via an owner-approved card", emoji="\u2709")
+    ctx.register_tool(name="relay_status", toolset="gateway_relay",
+                      schema=_STATUS_SCHEMA, handler=core.tool_status,
+                      description="Task status via hub", emoji="\U0001f50e")
     ctx.register_tool(name="relay_cancel", toolset="gateway_relay",
                       schema=_CANCEL_SCHEMA, handler=core.tool_cancel,
                       description="Cancel a submitted task", emoji="\u21a9")

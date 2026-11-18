@@ -1,5 +1,5 @@
 name: gateway-relay
-version: 0.5.0
+version: 0.6.0
 description: "Owner-approved agent-to-agent relay over a Telegram supergroup: approval cards with buttons in a dedicated topic, inbound parking, audit, no codes, no shell."
 author: Vasily Fedorov
 kind: tools
@@ -8,6 +8,7 @@ provides_tools:
   - relay_routes
   - relay_send
   - relay_cancel
+  - relay_status
   - ask_default
   - gateway_inbox
 provides_hooks:

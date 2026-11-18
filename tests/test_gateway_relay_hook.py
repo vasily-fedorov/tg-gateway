@@ -286,15 +286,17 @@ def run() -> dict:
     assert r == {"action": "skip", "reason": "relay:hub-rpc"}, r
     res["endpoint_inbound"] = True
 
-    # 18. endpoint: ответ drain уходит хабу JSON-конвертом
+    # 18. endpoint: ответ drain уходит хабу A2A-апдейтом (tasks/update)
     sent.clear()
     mod._run_profile_turn = lambda body: "DONE: свободно 31 ГБ"
     mod.drain_approved_in()
     hub_msgs = [m for m in sent if m[0] == int(HUB_ID)]
     assert hub_msgs, sent
     payload = json.loads(hub_msgs[-1][1])
-    assert payload == {"t": "reply", "task": "hub42", "verdict": "done",
-                       "text": "свободно 31 ГБ"}, payload
+    assert payload["method"] == "tasks/update", payload
+    assert payload["params"]["task"] == "hub42", payload
+    assert payload["params"]["status"]["state"] == "completed", payload
+    assert payload["params"]["artifact"]["parts"][0]["text"] == "свободно 31 ГБ", payload
     sent.clear()
     out_env = json.loads(mod.tool_send({"target": "aa", "text": "через rpc"}))
     assert out_env["status"] == "submitted_to_hub", out_env
@@ -303,6 +305,20 @@ def run() -> dict:
     assert wire[-1]["params"]["to"] == "aa"
     assert wire[-1]["params"]["message"]["parts"][0]["text"] == "через rpc"
     res["endpoint_reply_to_hub"] = True
+
+    # 18b. relay_status: tasks/get через хаб, ответ приходит в state["rpc"]
+    def fake_to_hub(text: str) -> bool:
+        env = json.loads(text)
+        with store.mutate() as st:
+            st.setdefault("rpc", {})[env["id"]] = {
+                "jsonrpc": "2.0", "id": env["id"],
+                "result": {"task": {"id": "t1", "status": {"state": "completed"}}}}
+        return True
+
+    mod._to_hub = fake_to_hub
+    view = json.loads(mod.tool_status({"task_id": "t1"}))
+    assert view["task"]["status"]["state"] == "completed", view
+    res["endpoint_relay_status"] = True
     mod._routes = base_routes
 
     # 19. the quiet-turn reply parsing still works
