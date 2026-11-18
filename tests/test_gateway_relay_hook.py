@@ -258,7 +258,43 @@ def run() -> dict:
     assert state["tasks"][stuck["task_id"]]["card_msg"]
     res["drain_ask_escalates_to_owner"] = True
 
-    # 17. the quiet-turn reply parsing still works
+    # 17. endpoint-режим: сообщение хаба -> задача сразу working, без карточки
+    HUB_ID = "7000000001"
+    base_routes = routes
+
+    def endpoint_routes():
+        d = base_routes()
+        d["mode"] = "endpoint"
+        d["hub"] = {"bot_id": int(HUB_ID), "username": "tg_gw_hub"}
+        return d
+
+    mod._routes = endpoint_routes
+    cards.clear()
+    envelope = json.dumps({"t": "inbound", "task": "hub42", "ctx": "c1", "hops": 2,
+                           "from": "aa", "text": "сколько места на диске?"})
+    r = asyncio.run(call(make_event(envelope, is_bot=True, user_id=HUB_ID, thread_id=None)))
+    assert r == {"action": "skip", "reason": "relay:hub-inbound"}, r
+    assert not cards, "в endpoint-режиме карточек нет"
+    ep = [t for t in tasks("in") if t.get("hub_task") == "hub42"]
+    assert ep and ep[-1]["status"] == "working", ep
+    # чужой бот в endpoint-режиме не принимается
+    r = asyncio.run(call(make_event("@gateway_alpha привет", is_bot=True, user_id=PEER_BOT_ID)))
+    assert r == {"action": "skip", "reason": "relay:bot-not-allowed"}, r
+    res["endpoint_inbound"] = True
+
+    # 18. endpoint: ответ drain уходит хабу JSON-конвертом
+    sent.clear()
+    mod._run_profile_turn = lambda body: "DONE: свободно 31 ГБ"
+    mod.drain_approved_in()
+    hub_msgs = [m for m in sent if m[0] == int(HUB_ID)]
+    assert hub_msgs, sent
+    payload = json.loads(hub_msgs[-1][1])
+    assert payload == {"t": "reply", "task": "hub42", "verdict": "done",
+                       "text": "свободно 31 ГБ"}, payload
+    res["endpoint_reply_to_hub"] = True
+    mod._routes = base_routes
+
+    # 19. the quiet-turn reply parsing still works
     raw = "────\n\u2624 Hermes\nDONE: 42\n────\n\nSession: local-x\n"
     assert mod._extract_reply(raw) == "DONE: 42", mod._extract_reply(raw)
     res["cli_reply_parsing"] = True

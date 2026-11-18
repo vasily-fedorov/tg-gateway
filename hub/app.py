@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""Hub: Telegram-бот, который держит маршруты, подтверждения и аудит.
+
+Схема (MVP):
+    агент A ──JSON──▶ hub ──карточка──▶ владелец ──клик──▶ hub ──JSON──▶ агент B
+                          ▲                                              │
+                          └──────────── JSON reply (done/skip/ask) ◀─────┘
+
+Карточки живут в ЛС с хабом; агенты общаются с хабом тоже в ЛС (bot-to-bot).
+"""
+from __future__ import annotations
+
+import json
+import pathlib
+import secrets
+import sys
+import time
+from typing import Any, Dict, Iterable, Optional
+
+from . import policy
+from .db import CARD_TTL_S, TERMINAL, Db
+from .tg import Tg
+
+HELP = (
+    "TG Gateway — шлюз между вашими ботами.\n\n"
+    "/pair <алиас> — код подключения бота (отправить код боту как /pair <код>)\n"
+    "/bots — подключённые боты\n"
+    "/routes — маршруты и политика\n"
+    "/route <от> <кому> ask|auto — политика подтверждений ('-' = вы)\n"
+    "/cancel <задача> — отменить задачу\n"
+    "/help — это сообщение\n\n"
+    "Всё, что бот присылает вам на подтверждение, приходит карточкой сюда.\n"
+    "Ответ на вопрос бота — просто текстом в ответ на карточку."
+)
+
+
+def new_id(n: int = 3) -> str:
+    return secrets.token_hex(n)
+
+
+def envelope(**payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False)
+
+
+class Hub:
+    def __init__(self, token: str, db_path: pathlib.Path | str, owner_ids: Iterable[int],
+                 *, tg: Optional[Tg] = None, clock=time.time):
+        self.tg = tg or Tg(token)
+        self.db = Db(db_path)
+        self.owners = {int(x) for x in owner_ids}
+        self.clock = clock
+
+    # ── основной цикл ────────────────────────────────────────────────────────
+    def run(self, *, max_updates: Optional[int] = None) -> None:
+        offset: Optional[int] = None
+        handled = 0
+        while True:
+            for update in self.tg.get_updates(offset):
+                offset = int(update["update_id"]) + 1
+                try:
+                    self.handle(update)
+                except Exception as exc:  # noqa: BLE001 — хаб не должен падать
+                    self.db.event("hub_error", error=f"{type(exc).__name__}: {exc}"[:300])
+                handled += 1
+                if max_updates and handled >= max_updates:
+                    return
+            self.expire_all()
+
+    def expire_all(self) -> None:
+        for row in self.db.q("SELECT tg_id FROM owners"):
+            self.db.expire(row["tg_id"])
+
+    # ── диспетчер ────────────────────────────────────────────────────────────
+    def handle(self, update: Dict[str, Any]) -> None:
+        if "callback_query" in update:
+            return self.on_callback(update["callback_query"])
+        msg = update.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        frm = msg.get("from") or {}
+        chat = msg.get("chat") or {}
+        uid = int(frm.get("id") or 0)
+        chat_id = chat.get("id")
+        if frm.get("is_bot"):
+            return self.on_agent(uid, frm.get("username") or str(uid), text, chat_id)
+        if uid in self.owners and chat.get("type") == "private":
+            return self.on_owner(uid, text)
+
+    # ── владелец ─────────────────────────────────────────────────────────────
+    def on_owner(self, uid: int, text: str) -> None:
+        self.db.ensure_owner(uid)
+        low = text.lower()
+        if low in ("/start", "/help", "help", "помощь"):
+            return self.say(uid, HELP)
+        if low.startswith("/pair"):
+            parts = text.split()
+            if len(parts) < 2:
+                return self.say(uid, "Использование: /pair <алиас>, например /pair aa")
+            alias = parts[1].strip()[:20]
+            code = "HUB-" + secrets.token_hex(2).upper()
+            self.db.add_pair_code(uid, alias, code)
+            return self.say(uid, f"Код для бота «{alias}»:\n\n/pair {code} {alias}\n\n"
+                                 "Отправьте эту строку в ЛС нужному боту-агенту.\n"
+                                 "Код одноразовый, живёт до первого использования.")
+        if low.startswith("/bots"):
+            rows = self.db.bots(uid)
+            if not rows:
+                return self.say(uid, "Пока никто не подключён. /pair <алиас>")
+            lines = [f"• {r['alias']} — @{r['username']} (id {r['bot_id']})" for r in rows]
+            return self.say(uid, "Подключённые боты:\n" + "\n".join(lines))
+        if low.startswith("/routes"):
+            rows = self.db.routes(uid)
+            if not rows:
+                return self.say(uid, "Маршрутов нет. /route <от> <кому> ask|auto")
+            lines = [f"• {r['src_alias'] or 'вы'} → {r['dst_alias']}: {r['policy']} "
+                     f"({r['per_hour']}/час)" for r in rows]
+            return self.say(uid, "Маршруты:\n" + "\n".join(lines))
+        if low.startswith("/route"):
+            parts = text.split()
+            if len(parts) < 4:
+                return self.say(uid, "Использование: /route <от> <кому> ask|auto")
+            src = "" if parts[1] in ("-", "вы", "me") else parts[1]
+            dst, pol = parts[2], parts[3].lower()
+            if pol not in ("ask", "auto"):
+                return self.say(uid, "Политика: ask или auto")
+            self.db.set_route(uid, src, dst, policy=pol)
+            return self.say(uid, f"Маршрут {src or 'вы'} → {dst}: {pol}")
+        if low.startswith("/cancel"):
+            parts = text.split()
+            if len(parts) < 2:
+                return self.say(uid, "Использование: /cancel <task_id>")
+            return self.cancel_task(uid, parts[1])
+        # ответ на висящий вопрос агента
+        pending = self.db.q("SELECT * FROM tasks WHERE owner_tg=? AND status='input-required' "
+                            "ORDER BY created_at DESC LIMIT 1", (uid,))
+        if pending and text:
+            task = pending[0]
+            self.db.update_task(task["task_id"], status="working", answer=text)
+            self.db.event("ask_answered", task_id=task["task_id"], owner=uid,
+                          length=len(text))
+            self.send_to_agent(task["dst_alias"], task["owner_tg"],
+                               envelope(t="answer", task=task["task_id"], text=text))
+            return self.say(uid, "Ответ передан агенту.")
+        self.say(uid, "Не понял. /help")
+
+    def cancel_task(self, uid: int, task_id: str) -> None:
+        task = self.db.task(task_id)
+        if not task or int(task["owner_tg"]) != uid:
+            return self.say(uid, "Задача не найдена.")
+        if task["status"] in TERMINAL:
+            return self.say(uid, f"Задача уже {task['status']}.")
+        self.db.update_task(task_id, status="cancelled")
+        self.db.event("task_cancelled", task_id=task_id, owner=uid)
+        if task["dst_alias"]:
+            self.send_to_agent(task["dst_alias"], uid,
+                               envelope(t="cancel", task=task_id, ctx=task["ctx"], hops=task["hops"]))
+        self.say(uid, f"Задача {task_id} отменена, агент уведомлён.")
+
+    # ── агент ────────────────────────────────────────────────────────────────
+    def on_agent(self, bot_id: int, username: str, text: str, chat_id: Any) -> None:
+        bot = self.db.bot_by_id(bot_id)
+        if not bot:
+            if text.lower().startswith("/pair"):
+                return self.pair_bot(bot_id, username, text)
+            return self.say(chat_id or bot_id, "Бот не подключён. Владелец: /pair <алиас>")
+        if not text.startswith("{"):
+            return self.say(bot_id, "Формат: JSON-конверт (см. README хаба)")
+        try:
+            env = json.loads(text)
+        except ValueError:
+            return self.say(bot_id, "Битый JSON.")
+        if env.get("t") == "relay":
+            return self.on_relay(bot, env)
+        if env.get("t") == "reply":
+            return self.on_reply(bot, env)
+        self.say(bot_id, "Неизвестный тип конверта.")
+
+    def pair_bot(self, bot_id: int, username: str, text: str) -> None:
+        parts = text.split()
+        if len(parts) < 2:
+            return self.say(bot_id, "Использование: /pair <код> [алиас]")
+        row = self.db.take_pair_code(parts[1])
+        if not row:
+            return self.say(bot_id, "Код не найден или уже использован.")
+        alias = (parts[2] if len(parts) > 2 else row["alias"]).strip()[:20]
+        self.db.pair_bot(bot_id=bot_id, username=username, alias=alias,
+                         owner=int(row["owner_tg"]))
+        self.db.event("bot_paired", owner=int(row["owner_tg"]), bot_id=bot_id, alias=alias)
+        self.say(bot_id, f"Подключено как «{alias}».")
+        self.say(int(row["owner_tg"]), f"✅ Подключён бот @{username} как «{alias}».\n"
+                                      f"Маршрут: /route - {alias} ask")
+
+    # ── ретрансляция ─────────────────────────────────────────────────────────
+    def on_relay(self, bot: Any, env: Dict[str, Any]) -> None:
+        owner = int(bot["owner_tg"])
+        dst_alias = str(env.get("to") or "").strip()
+        text = str(env.get("text") or "").strip()
+        ctx = str(env.get("ctx") or "") or None
+        hops = int(env.get("hops") or 1)
+        target = self.db.bot_by_alias(owner, dst_alias)
+        if not target:
+            return self.say(int(bot["bot_id"]), f"Нет бота «{dst_alias}» у владельца.")
+        if not policy.hop_allowed(hops):
+            self.db.event("hop_limit", owner=owner, hops=hops, src=bot["alias"], dst=dst_alias)
+            return self.say(int(bot["bot_id"]), f"Предел глубины ({policy.MAX_HOPS}).")
+        route = self.db.route(owner, bot["alias"], dst_alias)
+        max_text = int(route["max_text"]) if route else policy.MAX_TEXT
+        per_hour = int(route["per_hour"]) if route else policy.PER_HOUR
+        rpolicy = str(route["policy"]) if route else "ask"
+        err = policy.check_limits(text, max_text=max_text, per_hour=per_hour,
+                                  used_hour=self.db.hours_used(owner, bot["alias"], dst_alias))
+        if err:
+            self.db.event("refused", owner=owner, reason=err, src=bot["alias"], dst=dst_alias)
+            return self.say(int(bot["bot_id"]), f"Отказ: {err}")
+        task_id = new_id()
+        ctx = ctx or new_id(4)
+        approve = policy.needs_approval(policy=rpolicy, ctx=ctx if hops > 1 else "",
+                                        hops=hops, direction="relay")
+        self.db.create_task(task_id=task_id, owner=owner, direction="relay", ctx=ctx,
+                            hops=hops, src=bot["alias"], dst=dst_alias, text=text,
+                            status="submitted" if approve else "working")
+        self.db.event("relay_parked" if approve else "relay_auto", task_id=task_id, owner=owner,
+                      src=bot["alias"], dst=dst_alias, hops=hops, ctx=ctx, length=len(text))
+        if approve:
+            ok, res = self.tg.send(owner, self.card_text(bot["alias"], dst_alias, text, task_id,
+                                                         ctx, hops),
+                                   [[("Отправить", f"hub:ok:{task_id}"),
+                                     ("Отклонить", f"hub:no:{task_id}")]])
+            if ok and isinstance(res, dict):
+                self.db.update_task(task_id, card_chat=owner, card_msg=res.get("message_id"))
+            return
+        self.deliver(task_id)
+
+    def card_text(self, src: str, dst: str, text: str, task_id: str, ctx: str, hops: int) -> str:
+        preview = text.replace("\n", " ")[:300]
+        return (f"Переслать агенту «{dst}» от «{src}»?\n\n{preview}\n\n"
+                f"· задача {task_id} · ctx {ctx} · hop {hops}")
+
+    def deliver(self, task_id: str) -> bool:
+        task = self.db.task(task_id)
+        if not task:
+            return False
+        target = self.db.bot_by_alias(int(task["owner_tg"]), task["dst_alias"])
+        if not target:
+            self.db.update_task(task_id, status="failed")
+            self.db.event("deliver_failed", task_id=task_id, reason="no_target")
+            return False
+        hops = int(task["hops"]) + 1
+        ok, res = self.tg.send(int(target["bot_id"]), envelope(
+            t="inbound", task=task_id, ctx=task["ctx"], hops=hops,
+            **{"from": task["src_alias"]}, text=task["text"]))
+        status = "working" if ok else "failed"
+        self.db.update_task(task_id, status=status, hops=hops)
+        self.db.event("delivered" if ok else "deliver_failed", task_id=task_id,
+                      to=task["dst_alias"], hops=hops, error=None if ok else str(res)[:200])
+        return bool(ok)
+
+    # ── ответ агента ─────────────────────────────────────────────────────────
+    def on_reply(self, bot: Any, env: Dict[str, Any]) -> None:
+        owner = int(bot["owner_tg"])
+        task = self.db.task(str(env.get("task") or ""))
+        if not task or int(task["owner_tg"]) != owner:
+            return self.say(int(bot["bot_id"]), "Задача не найдена.")
+        verdict = str(env.get("verdict") or "done").lower()
+        text = str(env.get("text") or "").strip()
+        if verdict == "skip":
+            self.db.update_task(task["task_id"], status="skipped")
+            self.db.event("task_skipped", task_id=task["task_id"], owner=owner)
+            return
+        if verdict == "ask":
+            question = str(env.get("question") or text or "").strip()[:1500]
+            self.db.update_task(task["task_id"], status="input-required", question=question)
+            self.db.event("task_input_required", task_id=task["task_id"], owner=owner)
+            self.tg.send(owner, f"Агент «{task['dst_alias']}» спрашивает:\n\n{question}\n\n"
+                                f"Ответьте текстом на это сообщение.\n· задача {task['task_id']}")
+            return
+        # done: ответ возвращается инициатору как новая задача в том же ctx
+        src = str(task["src_alias"])
+        dst = str(task["dst_alias"])
+        hops = int(task["hops"])
+        back_id = new_id()
+        route = self.db.route(owner, dst, src)
+        rpolicy = str(route["policy"]) if route else "ask"
+        approve = policy.needs_approval(policy=rpolicy, ctx=task["ctx"], hops=hops + 1,
+                                        direction="reply")
+        # hops у задачи = номер хопа, с которым сообщение уйдёт получателю (deliver добавит +1)
+        self.db.create_task(task_id=back_id, owner=owner, direction="reply", ctx=task["ctx"],
+                            hops=hops, src=dst, dst=src, text=text,
+                            status="submitted" if approve else "working")
+        self.db.event("reply_parked" if approve else "reply_auto", task_id=back_id, owner=owner,
+                      src=dst, dst=src, hops=hops + 1)
+        self.db.update_task(task["task_id"], status="completed")
+        if approve:
+            ok, res = self.tg.send(owner, self.card_text(dst, src, text, back_id, task["ctx"],
+                                                         hops + 1),
+                                   [[("Переслать", f"hub:ok:{back_id}"),
+                                     ("Отклонить", f"hub:no:{back_id}")]])
+            if ok and isinstance(res, dict):
+                self.db.update_task(back_id, card_chat=owner, card_msg=res.get("message_id"))
+            return
+        self.deliver(back_id)
+
+    # ── клик по карточке ─────────────────────────────────────────────────────
+    def on_callback(self, cb: Dict[str, Any]) -> None:
+        uid = int((cb.get("from") or {}).get("id") or 0)
+        data = str(cb.get("data") or "")
+        cb_id = str(cb.get("id") or "")
+        msg = cb.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        msg_id = msg.get("message_id")
+        if uid not in self.owners:
+            return self.tg.answer_callback(cb_id, "Нет прав")
+        parts = data.split(":")
+        if len(parts) != 3 or parts[0] != "hub":
+            return self.tg.answer_callback(cb_id, "Непонятная карточка")
+        _, verdict, task_id = parts
+        task = self.db.task(task_id)
+        if not task:
+            self.tg.answer_callback(cb_id, "Задача не найдена")
+            return self.finish_card(chat_id, msg_id, "⌛ Задача неактивна.")
+        if task["status"] in TERMINAL:
+            self.tg.answer_callback(cb_id, "Уже закрыта")
+            return self.finish_card(chat_id, msg_id, f"⌛ Задача уже {task['status']}.")
+        self.tg.answer_callback(cb_id, "Принято")
+        if verdict == "no":
+            self.db.update_task(task_id, status="rejected")
+            self.db.event("card_rejected", task_id=task_id, owner=uid)
+            return self.finish_card(chat_id, msg_id, "❌ Отклонено.")
+        self.db.update_task(task_id, status="working")
+        self.db.event("card_approved", task_id=task_id, owner=uid)
+        ok = self.deliver(task_id)
+        target = self.db.bot_by_alias(uid, task["dst_alias"])
+        self.finish_card(chat_id, msg_id,
+                         f"✅ Отправлено → {task['dst_alias']}" if ok else "❌ Не доставлено")
+
+    def finish_card(self, chat_id: Any, msg_id: Any, text: str) -> None:
+        if chat_id and msg_id:
+            self.tg.edit(chat_id, int(msg_id), text)
+        else:
+            self.say(chat_id, text)
+
+    # ── утилиты ──────────────────────────────────────────────────────────────
+    def send_to_agent(self, alias: str, owner: int, text: str) -> bool:
+        bot = self.db.bot_by_alias(owner, alias)
+        if not bot:
+            return False
+        ok, _ = self.tg.send(int(bot["bot_id"]), text)
+        return bool(ok)
+
+    def say(self, chat_id: Any, text: str) -> None:
+        if chat_id is None:
+            return
+        self.tg.send(chat_id, text)
+
+
+def main() -> int:
+    import os
+    token = os.environ.get("TG_GATEWAY_TOKEN", "").strip()
+    owners = os.environ.get("TG_GATEWAY_OWNERS", "").strip()
+    if not token or not owners:
+        print("нужны TG_GATEWAY_TOKEN и TG_GATEWAY_OWNERS", file=sys.stderr)
+        return 2
+    db_path = os.environ.get("TG_GATEWAY_DB", str(pathlib.Path.home() / "tg-gateway/hub.sqlite3"))
+    hub = Hub(token, db_path, [int(x) for x in owners.split(",") if x.strip()])
+    print(f"hub: db={db_path} owners={sorted(hub.owners)}", flush=True)
+    hub.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

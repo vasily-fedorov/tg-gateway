@@ -108,6 +108,29 @@ def _routes_path() -> Path:
     return _home() / "gateway-routes.json"
 
 
+def _hub_cfg() -> Dict[str, Any]:
+    """{"bot_id": int, "username": str} если профиль работает как endpoint хаба."""
+    data = _routes()
+    if str(data.get("mode") or "").strip().lower() != "endpoint":
+        return {}
+    hub = data.get("hub") or {}
+    if not hub.get("bot_id"):
+        return {}
+    return {"bot_id": str(hub.get("bot_id")), "username": str(hub.get("username") or "")}
+
+
+def _to_hub(text: str) -> bool:
+    """Отправить JSON-конверт хабу в ЛС. True, если доставлено."""
+    hub = _hub_cfg()
+    if not hub:
+        return False
+    chat = int(hub["bot_id"]) if str(hub["bot_id"]).isdigit() else hub["bot_id"]
+    ok, info = _tg_send(chat, None, text, None)
+    if not ok:
+        _audit("hub_send_failed", error=str(info)[:200])
+    return bool(ok)
+
+
 def _state_path() -> Path:
     return _home() / "gateway-relay-state.json"
 
@@ -306,6 +329,17 @@ def tool_send(args: Dict[str, Any], **kwargs: Any) -> str:
     if reason:
         _audit("refused", target=target, reason=reason, digest=_digest(text), length=len(text))
         return json.dumps({"error": "передача отклонена", "reason": reason}, ensure_ascii=False)
+
+    hub = _hub_cfg()
+    if hub:
+        hops = 1
+        ctx = ""
+        env = {"t": "relay", "to": target, "ctx": ctx, "hops": hops, "text": text}
+        ok = _to_hub(json.dumps(env, ensure_ascii=False))
+        _audit("relay_to_hub", target=target, ok=ok, digest=_digest(text), length=len(text))
+        if not ok:
+            return json.dumps({"error": "хаб недоступен"}, ensure_ascii=False)
+        return json.dumps({"status": "sent_to_hub", "target": target}, ensure_ascii=False)
 
     store = _store()
     with store.mutate() as state:
@@ -574,6 +608,9 @@ def drain_approved_in(ctx: Any = None) -> int:
         if upper.startswith("SKIP"):
             with store.mutate() as state:
                 task_state.TaskStore.transition(state, task_id, "skipped")
+            if _hub_cfg():
+                _to_hub(json.dumps({"t": "reply", "task": item.get("hub_task") or "",
+                                    "verdict": "skip"}, ensure_ascii=False))
             _audit("inbound_skipped", task=task_id, hop=hop)
             continue
         if upper.startswith("ASK:"):
@@ -597,15 +634,25 @@ def drain_approved_in(ctx: Any = None) -> int:
                     task_state.TaskStore.transition(state, task_id, "input-required",
                                                     question=question, card_chat=card_chat,
                                                     card_msg=card_msg)
+                if _hub_cfg():
+                    _to_hub(json.dumps({"t": "reply", "task": item.get("hub_task") or "",
+                                        "verdict": "ask", "question": question},
+                                       ensure_ascii=False))
                 _audit("task_input_required", task=task_id, peer=peer)
                 continue
         payload = reply.strip()
         if payload.upper().startswith("DONE:"):
             payload = payload[5:].strip()
-        mention = f"@{peer} " if peer else ""
-        ok, info = _tg_send(item.get("chat_id"), item.get("thread_id"),
-                            f"[gw ctx:{item.get('context_id')} #{hop + 1}] {mention}{payload}",
-                            item.get("message_id"))
+        if _hub_cfg():
+            ok = _to_hub(json.dumps({"t": "reply", "task": item.get("hub_task") or "",
+                                     "verdict": "done", "text": payload},
+                                    ensure_ascii=False))
+            info = "hub"
+        else:
+            mention = f"@{peer} " if peer else ""
+            ok, info = _tg_send(item.get("chat_id"), item.get("thread_id"),
+                                f"[gw ctx:{item.get('context_id')} #{hop + 1}] {mention}{payload}",
+                                item.get("message_id"))
         with store.mutate() as state:
             task_state.TaskStore.transition(state, task_id, "completed" if ok else "failed",
                                             last_error=None if ok else str(info)[:200])
@@ -764,7 +811,50 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
                    digest=_digest(text), length=len(text))
             return {"action": "skip", "reason": "relay:no-mention"}
 
+        hub = _hub_cfg()
+        if hub and str(uid) == hub["bot_id"]:
+            # Endpoint-режим: сообщения принимаем ТОЛЬКО от хаба, карточку не рисуем —
+            # подтверждение уже получено владельцем на стороне хаба.
+            try:
+                env = json.loads(text)
+            except ValueError:
+                _audit("hub_bad_json", length=len(text))
+                return {"action": "skip", "reason": "relay:hub-bad-json"}
+            kind = str(env.get("t") or "")
+            if kind in ("inbound", "answer"):
+                body = str(env.get("text") or "").strip()
+                store = _store()
+                with store.mutate() as state:
+                    store.expire(state)
+                    task = task_state.TaskStore.create(
+                        state, direction="in", peer=str(env.get("from") or "hub"), text=body,
+                        chat_id=hub["bot_id"], thread_id=None,
+                        message_id=None, context_id=str(env.get("ctx") or ""),
+                        hops=int(env.get("hops") or 1))
+                    task["hub_task"] = str(env.get("task") or "")
+                    if kind == "answer":
+                        task["answer"] = body
+                    task_state.TaskStore.transition(state, task["task_id"], "working")
+                    task_id = task["task_id"]
+                _audit("hub_inbound", task=task_id, ctx=env.get("ctx"), hop=env.get("hops"),
+                       kind=kind, length=len(body))
+                return {"action": "skip", "reason": "relay:hub-inbound"}
+            if kind == "cancel":
+                store = _store()
+                with store.mutate() as state:
+                    for task in (state.get("tasks") or {}).values():
+                        if (task.get("hub_task") == str(env.get("task"))
+                                and not task_state.TaskStore.is_terminal(task)):
+                            task_state.TaskStore.transition(state, task["task_id"], "cancelled")
+                _audit("hub_cancel", hub_task=env.get("task"))
+                return {"action": "skip", "reason": "relay:hub-cancel"}
+            _audit("hub_unknown_kind", kind=kind)
+            return {"action": "skip", "reason": "relay:hub-unknown"}
+
         if getattr(src, "is_bot", False):
+            if hub:  # endpoint-режим: чужие боты не принимаются вовсе
+                _audit("bot_not_allowed", user_id=uid, mode="endpoint")
+                return {"action": "skip", "reason": "relay:bot-not-allowed"}
             # Bot-authored inbound: only from this group, only from bots in the registry,
             # and only with an explicit @mention. It becomes a TASK and never reaches the
             # model before the owner approves the card.

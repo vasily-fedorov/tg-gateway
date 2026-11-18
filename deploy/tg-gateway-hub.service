@@ -1,0 +1,17 @@
+[Unit]
+Description=TG Gateway hub (agent-to-agent Telegram relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/user/workspace/tg-gateway
+EnvironmentFile=/home/user/tg-gateway/.env
+ExecStart=/usr/bin/python3 -m hub.app
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
