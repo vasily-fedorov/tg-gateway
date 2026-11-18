@@ -159,13 +159,12 @@ class Hub:
                                  "LIMIT ?", (uid, min(limit, 50)))
             if not rows:
                 return self.say(uid, "Задач нет.")
-            lines = ["задача  напр  состояние      хоп  время      текст"]
+            lines = []
             for r in rows:
                 when = time.strftime("%H:%M", time.localtime(float(r["created_at"])))
-                arrow = f"{r['src_alias']}→{r['dst_alias']}"
-                text_short = (r["text"] or r["question"] or "").replace("\n", " ")[:44]
-                lines.append(f"{r['task_id']} {arrow:>10} {r['status']:<14} {r['hops']:<4} "
-                             f"{when:<10} {text_short}")
+                text_short = (r["text"] or r["question"] or "").replace("\n", " ")[:40]
+                lines.append(f"{r['task_id']}  {r['src_alias']}→{r['dst_alias']}  "
+                             f"{r['status']}  h{r['hops']}  {when}  «{text_short}»")
             self.db.event("owner_log", owner=uid, alias=alias or "*", count=len(rows))
             return self.say(uid, "```\n" + "\n".join(lines) + "\n```")
         if low.startswith("/task"):
