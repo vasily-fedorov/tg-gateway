@@ -401,6 +401,20 @@ def run() -> dict:
     assert any(e.get("text") == "ответ 42" for e in envelopes(tg, GOD)), envelopes(tg, GOD)
     res["rpc_tasks_update"] = True
 
+    # глубина: 4-й хоп не доставляется даже через A2A
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.db.set_route(OWNER, "god", "aa", policy="auto")
+    hub.db.set_route(OWNER, "aa", "god", policy="auto")
+    hub.db.create_task(task_id="deep1", owner=OWNER, direction="reply", ctx="c1", hops=3,
+                       src="aa", dst="god", text="четвёртое", status="working")
+    before = len(envelopes(tg, GOD))
+    assert hub.deliver("deep1") is False
+    assert len(envelopes(tg, GOD)) == before
+    assert hub.db.task("deep1")["status"] == "failed"
+    res["hop_budget_blocks_4th"] = True
+
     # legacy-конверт продолжает работать
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),
                    is_bot=True, username="god"))

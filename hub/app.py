@@ -497,6 +497,13 @@ class Hub:
             self.db.event("deliver_failed", task_id=task_id, reason="no_target")
             return False
         hops = int(task["hops"]) + 1
+        if hops > policy.MAX_HOPS:
+            # Бюджет глубины: 4-е сообщение в цепочке не доставляем вообще.
+            self.db.update_task(task_id, status="failed")
+            self.db.event("hop_limit", task_id=task_id, hops=hops, owner=int(task["owner_tg"]))
+            self.say(int(task["owner_tg"]),
+                     f"⛔ Предел глубины ({policy.MAX_HOPS}): задача {task_id} остановлена.")
+            return False
         ok, res = self.tg.send(int(target["bot_id"]), envelope(
             t="inbound", task=task_id, ctx=task["ctx"], hops=hops,
             **{"from": task["src_alias"]}, text=task["text"]))
