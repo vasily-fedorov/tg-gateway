@@ -252,8 +252,7 @@ class Hub:
         self.db.update_task(task_id, status="cancelled")
         self.db.event("task_cancelled", task_id=task_id, owner=uid)
         if task["dst_alias"]:
-            self.send_to_agent(task["dst_alias"], uid,
-                               envelope(t="cancel", task=task_id, ctx=task["ctx"], hops=task["hops"]))
+            self._notify_cancel(task["dst_alias"], uid, task_id)
         self.say(uid, f"Задача {task_id} отменена, агент уведомлён.")
 
     # ── агент ────────────────────────────────────────────────────────────────
@@ -264,18 +263,21 @@ class Hub:
                 return self.pair_bot(bot_id, username, text)
             return self.say(chat_id or bot_id, "Бот не подключён. Владелец: /pair <алиас>")
         if not text.startswith("{"):
-            return self.say(bot_id, "Формат: JSON-RPC 2.0 или конверт (см. README хаба)")
+            return self.say(bot_id, rpc.rpc_err(None, rpc.ERR_PARSE,
+                                                "нужен JSON-RPC 2.0"))
         try:
             env = json.loads(text)
         except ValueError:
             return self.say(bot_id, "Битый JSON.")
-        if "jsonrpc" in env or "method" in env:
-            return self.on_rpc(bot, env)
-        if env.get("t") == "relay":
-            return self.on_relay(bot, env)
-        if env.get("t") == "reply":
-            return self.on_reply(bot, env)
-        self.say(bot_id, "Неизвестный тип конверта.")
+        if "method" not in env:
+            return self.say(bot_id, rpc.rpc_err(env.get("id"), rpc.ERR_INVALID_REQUEST,
+                                                "нужен JSON-RPC 2.0 (method/params)"))
+        return self.on_rpc(bot, env)
+
+    def _notify_cancel(self, alias: str, owner: int, task_id: str) -> bool:
+        payload = {"jsonrpc": "2.0", "id": "c-" + new_id(3), "method": "tasks/cancel",
+                   "params": {"id": task_id, "metadata": {"task": task_id}}}
+        return self.send_to_agent(alias, owner, json.dumps(payload, ensure_ascii=False))
 
     # ── JSON-RPC (A2A-форма поверх Telegram) ─────────────────────────────────
     def on_rpc(self, bot: Any, env: Dict[str, Any]) -> None:
@@ -384,9 +386,7 @@ class Hub:
             self.db.update_task(task["task_id"], status="cancelled")
             self.db.event("task_cancelled", task_id=task["task_id"], owner=owner, via="rpc")
             if task["dst_alias"]:
-                self.send_to_agent(task["dst_alias"], owner,
-                                   envelope(t="cancel", task=task["task_id"],
-                                            ctx=task["ctx"], hops=task["hops"]))
+                self._notify_cancel(task["dst_alias"], owner, task["task_id"])
             return self.say(bot_id, rpc.rpc_ok(rpc_id,
                                                {"task": rpc.task_view(self.db.task(task["task_id"]))}))
 
@@ -504,9 +504,17 @@ class Hub:
             self.say(int(task["owner_tg"]),
                      f"⛔ Предел глубины ({policy.MAX_HOPS}): задача {task_id} остановлена.")
             return False
-        ok, res = self.tg.send(int(target["bot_id"]), envelope(
-            t="inbound", task=task_id, ctx=task["ctx"], hops=hops,
-            **{"from": task["src_alias"]}, text=task["text"]))
+        payload = {
+            "jsonrpc": "2.0", "id": "d-" + new_id(4), "method": "message/send",
+            "params": {
+                "message": {"role": "user", "messageId": "m-" + task_id,
+                            "contextId": task["ctx"],
+                            "parts": [{"kind": "text", "text": task["text"] or ""}]},
+                "metadata": {"task": task_id, "hops": hops, "from": task["src_alias"]},
+            },
+        }
+        ok, res = self.tg.send(int(target["bot_id"]),
+                               json.dumps(payload, ensure_ascii=False))
         status = "working" if ok else "failed"
         self.db.update_task(task_id, status=status, hops=hops)
         self.db.event("delivered" if ok else "deliver_failed", task_id=task_id,

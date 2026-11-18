@@ -69,11 +69,42 @@ def pair(hub: Hub, tg: FakeTg, *, bot_id: int, alias: str) -> None:
     hub.handle(msg(bot_id, code, is_bot=True, username=alias))
 
 
+def send_relay(hub: Hub, text: str, to: str = "aa", *, bot_id: int = GOD,
+               username: str = "god", ctx: str = "", hops: int = 1,
+               message_id: str | None = None) -> str:
+    """A2A message/send от имени агента; возвращает rpc id."""
+    import uuid
+    mid = message_id or ("m-" + uuid.uuid4().hex[:8])
+    hub.handle(msg(bot_id, json.dumps({
+        "jsonrpc": "2.0", "id": "s-" + uuid.uuid4().hex[:6], "method": "message/send",
+        "params": {"message": {"role": "user", "messageId": mid, "contextId": ctx,
+                               "parts": [{"kind": "text", "text": text}]},
+                   "to": to, "metadata": {"hops": hops}}}), is_bot=True, username=username))
+    return mid
+
+
 def envelopes(tg: FakeTg, chat_id: int) -> list[dict]:
+    """Нормализованный вид доставленного агенту: A2A message/send → {t,text,task,hops,from}."""
     out = []
     for item in tg.sent:
-        if item["chat"] == chat_id and item["text"].startswith("{"):
-            out.append(json.loads(item["text"]))
+        if item["chat"] != chat_id or not item["text"].startswith("{"):
+            continue
+        data = json.loads(item["text"])
+        if "result" in data or "error" in data:   # это ответ хаба на RPC, не доставка
+            continue
+        method = data.get("method")
+        params = data.get("params") or {}
+        if method == "message/send":
+            meta = params.get("metadata") or {}
+            text = "".join(str(x.get("text") or "")
+                           for x in ((params.get("message") or {}).get("parts") or []))
+            out.append({"t": "inbound", "text": text, "task": meta.get("task"),
+                        "hops": meta.get("hops"), "from": meta.get("from"),
+                        "jsonrpc": data})
+        elif method == "tasks/cancel":
+            out.append({"t": "cancel", "task": params.get("id"), "jsonrpc": data})
+        else:
+            out.append(data)
     return out
 
 
@@ -103,8 +134,7 @@ def run() -> dict:
     pair(hub, tg, bot_id=AA, alias="aa")
     hub.db.set_route(OWNER, "god", "aa", policy="ask")
     before = len(envelopes(tg, AA))
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "привет, aa"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "привет, aa")
     cards = [s for s in tg.sent if s["chat"] == OWNER and s["buttons"]]
     assert cards and cards[-1]["buttons"][0][0][1].startswith("hub:ok:"), cards
     assert len(envelopes(tg, AA)) == before, "до клика доставки быть не должно"
@@ -124,8 +154,11 @@ def run() -> dict:
     # 5. ответ агента (done) при policy=auto уходит без карточки
     hub.db.set_route(OWNER, "aa", "god", policy="auto")
     before = len(envelopes(tg, GOD))
-    hub.handle(msg(AA, json.dumps({"t": "reply", "task": task_id, "verdict": "done",
-                                   "text": "и тебе привет"}), is_bot=True, username="aa"))
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "u-1", "method": "tasks/update",
+                                    "params": {"task": task_id,
+                                               "status": {"state": "completed"},
+                                               "artifact": {"parts": [{"kind": "text",
+                                                                       "text": "и тебе привет"}]}}}), is_bot=True, username="aa"))
     got = envelopes(tg, GOD)
     assert len(got) == before + 1 and got[-1]["text"] == "и тебе привет", got
     assert got[-1]["hops"] == 3
@@ -133,7 +166,9 @@ def run() -> dict:
 
     # 6. skip -> задача закрыта, доставки нет
     before = len(envelopes(tg, AA))
-    hub.handle(msg(AA, json.dumps({"t": "reply", "task": task_id, "verdict": "skip"}),
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "u-2", "method": "tasks/update",
+                   "params": {"task": task_id, "status": {"state": "completed"},
+                              "metadata": {"skipped": True}}}),
                    is_bot=True, username="aa"))
     assert len(envelopes(tg, AA)) == before
     assert hub.db.task(task_id)["status"] == "skipped"
@@ -145,14 +180,16 @@ def run() -> dict:
     pair(hub, tg, bot_id=AA, alias="aa")
     hub.db.set_route(OWNER, "god", "aa", policy="auto")
     hub.db.set_route(OWNER, "aa", "god", policy="auto")
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "сколько места на /?"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "сколько места на /?")
     card = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
     t2 = card["buttons"][0][0][1].split(":")[2]
     hub.handle(cb(OWNER, f"hub:ok:{t2}"))
     assert envelopes(tg, AA)[-1]["task"] == t2
-    hub.handle(msg(AA, json.dumps({"t": "reply", "task": t2, "verdict": "ask",
-                                   "question": "какой диск имеется в виду?"}),
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "u-3", "method": "tasks/update",
+                                    "params": {"task": t2,
+                                               "status": {"state": "input-required",
+                                                          "message": {"parts": [{"kind": "text",
+                                                                                 "text": "какой диск имеется в виду?"}]}}}}),
                    is_bot=True, username="aa"))
     assert hub.db.task(t2)["status"] == "input-required"
     assert any("какой диск" in s["text"] for s in tg.sent if s["chat"] == OWNER)
@@ -166,20 +203,19 @@ def run() -> dict:
     hub, tg = new_hub()
     pair(hub, tg, bot_id=GOD, alias="god")
     pair(hub, tg, bot_id=AA, alias="aa")
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "hops": 4, "text": "x"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "x", hops=4)
     assert any("Предел глубины" in s["text"] for s in tg.sent), tg.sent[-1]
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "a" * 4000}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "a" * 4000)
     assert any("слишком длинный" in s["text"] for s in tg.sent), tg.sent[-1]
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa",
-                                    "text": "пароль: hunter2"}), is_bot=True, username="god"))
-    assert any("фильтр" in s["text"] for s in tg.sent), tg.sent[-1]
+    send_relay(hub, "пароль: hunter2")
     res["limits_and_hops"] = True
 
     # 9. чужой бот без пары
     hub, tg = new_hub()
-    hub.handle(msg(999, json.dumps({"t": "relay", "to": "aa", "text": "x"}), is_bot=True))
+    hub.handle(msg(999, json.dumps({"jsonrpc": "2.0", "id": "s-9", "method": "message/send",
+                                    "params": {"message": {"role": "user", "messageId": "z1",
+                                                           "parts": [{"kind": "text", "text": "x"}]},
+                                               "to": "aa"}}), is_bot=True))
     assert any("не подключён" in s["text"] for s in tg.sent), tg.sent
     res["unknown_bot_refused"] = True
 
@@ -187,8 +223,7 @@ def run() -> dict:
     hub, tg = new_hub()
     pair(hub, tg, bot_id=GOD, alias="god")
     pair(hub, tg, bot_id=AA, alias="aa")
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старое"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "старое")
     task_id = [r for r in hub.db.open_tasks(OWNER)][0]["task_id"]
     hub.db.conn.execute("UPDATE tasks SET created_at=? WHERE task_id=?",
                         (policy_now() - 3600, task_id))
@@ -218,8 +253,7 @@ def run() -> dict:
 
     # 10c. чужая карточка не подтверждается
     hub.db.set_route(OWNER, "god", "aa", policy="ask")
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "только для A"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "только для A")
     card = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
     task_a = card["buttons"][0][0][1].split(":")[2]
     before = len(envelopes(tg, AA))
@@ -238,8 +272,7 @@ def run() -> dict:
     assert int(hub.db.bot_by_id(GOD)["owner_tg"]) == OWNER, "перепривязка запрещена"
     hub.handle(msg(OWNER, "/unpair aa"))
     assert not hub.db.bot_by_alias(OWNER, "aa")
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "x"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "x")
     assert any("Нет бота" in x["text"] for x in tg.sent), tg.sent[-1]
     res["bot_single_owner_and_unpair"] = True
 
@@ -281,8 +314,7 @@ def run() -> dict:
     links = hub.db.links_for_owner(OWNER)
     assert links and links[0]["dst_username"] == "owner_b_bot", links
     # A шлёт сообщение на @owner_b_bot: карточка A -> карточка B -> доставка
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "@owner_b_bot", "text": "привет B"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "привет B", to="@owner_b_bot")
     card_a = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
     task_id = card_a["buttons"][0][0][1].split(":")[2]
     assert not envelopes(tg, BOT_B), "до подтверждений доставки быть не должно"
@@ -300,8 +332,7 @@ def run() -> dict:
     res["cross_owner_link_flow"] = True
 
     # 10h. отказ получателя и разрыв связи
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "@owner_b_bot", "text": "второе"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "второе", to="@owner_b_bot")
     t2 = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
     task2 = t2["buttons"][0][0][1].split(":")[2]
     hub.handle(cb(OWNER, f"hub:ok:{task2}"))
@@ -310,8 +341,7 @@ def run() -> dict:
     assert not [e for e in envelopes(tg, BOT_B) if e.get("text") == "второе"]
     link_id = hub.db.links_for_owner(OWNER)[0]["id"]
     hub.handle(msg(OWNER, f"/unlink {link_id}"))
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "@owner_b_bot", "text": "третье"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "третье", to="@owner_b_bot")
     assert any("Нет бота" in x["text"] for x in tg.sent), tg.sent[-1]
     res["cross_owner_reject_and_unlink"] = True
 
@@ -320,8 +350,7 @@ def run() -> dict:
     pair(hub, tg, bot_id=GOD, alias="god")
     hub.handle(msg(OWNER, "/link LINK-NOPE god"))
     assert any("не найден" in x["text"] for x in tg.sent), tg.sent[-1]
-    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "@nobody_bot", "text": "x"}),
-                   is_bot=True, username="god"))
+    send_relay(hub, "x", to="@nobody_bot")
     assert any("Нет бота" in x["text"] for x in tg.sent), tg.sent[-1]
     res["no_link_no_delivery"] = True
 
@@ -415,11 +444,14 @@ def run() -> dict:
     assert hub.db.task("deep1")["status"] == "failed"
     res["hop_budget_blocks_4th"] = True
 
-    # legacy-конверт продолжает работать
+    # старый самодельный конверт больше не принимается
+    before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),
                    is_bot=True, username="god"))
-    assert any("Переслать" in x["text"] for x in tg.sent), "legacy relay сломался"
-    res["legacy_envelope_still_works"] = True
+    assert len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]]) == before_cards
+    last = json.loads(tg.sent[-1]["text"])
+    assert "error" in last or "Связь" in tg.sent[-1]["text"], last
+    res["legacy_envelope_rejected"] = True
 
     # 11. policy-функции
     assert policy.needs_approval(policy="ask", ctx="", hops=1, direction="relay") is True

@@ -270,13 +270,35 @@ def run() -> dict:
 
     mod._routes = endpoint_routes
     cards.clear()
-    envelope = json.dumps({"t": "inbound", "task": "hub42", "ctx": "c1", "hops": 2,
-                           "from": "aa", "text": "сколько места на диске?"})
+    envelope = json.dumps({"jsonrpc": "2.0", "id": "d-1", "method": "message/send",
+                           "params": {"message": {"role": "user", "messageId": "m-1",
+                                                  "contextId": "c1",
+                                                  "parts": [{"kind": "text",
+                                                             "text": "сколько места на диске?"}]},
+                                      "metadata": {"task": "hub42", "hops": 2, "from": "aa"}}})
     r = asyncio.run(call(make_event(envelope, is_bot=True, user_id=HUB_ID, thread_id=None)))
     assert r == {"action": "skip", "reason": "relay:hub-inbound"}, r
     assert not cards, "в endpoint-режиме карточек нет"
     ep = [t for t in tasks("in") if t.get("hub_task") == "hub42"]
     assert ep and ep[-1]["status"] == "working", ep
+    # старый конверт больше не принимается
+    legacy = json.dumps({"t": "inbound", "task": "x", "ctx": "c", "hops": 1,
+                         "from": "aa", "text": "старый формат"})
+    r = asyncio.run(call(make_event(legacy, is_bot=True, user_id=HUB_ID, thread_id=None)))
+    assert r == {"action": "skip", "reason": "relay:hub-unknown"}, r
+    # tasks/cancel отменяет локальную задачу
+    fresh = json.dumps({"jsonrpc": "2.0", "id": "d-2", "method": "message/send",
+                        "params": {"message": {"role": "user", "messageId": "m-2",
+                                               "contextId": "c2",
+                                               "parts": [{"kind": "text", "text": "на отмену"}]},
+                                   "metadata": {"task": "hub9", "hops": 1, "from": "aa"}}})
+    asyncio.run(call(make_event(fresh, is_bot=True, user_id=HUB_ID, thread_id=None)))
+    cancel = json.dumps({"jsonrpc": "2.0", "id": "c-1", "method": "tasks/cancel",
+                         "params": {"id": "hub9"}})
+    r = asyncio.run(call(make_event(cancel, is_bot=True, user_id=HUB_ID, thread_id=None)))
+    assert r == {"action": "skip", "reason": "relay:hub-cancel"}, r
+    assert any(t.get("hub_task") == "hub9" and t["status"] == "cancelled" for t in tasks("in"))
+
     # чужой бот в endpoint-режиме не принимается
     r = asyncio.run(call(make_event("@gateway_alpha привет", is_bot=True, user_id=PEER_BOT_ID)))
     assert r == {"action": "skip", "reason": "relay:bot-not-allowed"}, r

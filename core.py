@@ -887,7 +887,7 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
             except ValueError:
                 _audit("hub_bad_json", length=len(text))
                 return {"action": "skip", "reason": "relay:hub-bad-json"}
-            if "jsonrpc" in env:
+            if "jsonrpc" in env and ("result" in env or "error" in env):
                 store = _store()
                 with store.mutate() as state:
                     rpc_id = str(env.get("id") or "")
@@ -898,7 +898,33 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
                 _audit("hub_rpc_result", rpc=env.get("id"),
                        ok="result" in env, length=len(text))
                 return {"action": "skip", "reason": "relay:hub-rpc"}
-            kind = str(env.get("t") or "")
+
+            method = str(env.get("method") or "")
+            params = env.get("params") or {}
+            if method == "tasks/cancel":
+                hub_task = str(params.get("id") or (params.get("metadata") or {}).get("task") or "")
+                store = _store()
+                with store.mutate() as state:
+                    for task in (state.get("tasks") or {}).values():
+                        if task.get("hub_task") == hub_task and not task_state.TaskStore.is_terminal(task):
+                            task_state.TaskStore.transition(state, task["task_id"], "cancelled")
+                _audit("hub_cancel", hub_task=hub_task)
+                return {"action": "skip", "reason": "relay:hub-cancel"}
+
+            if method == "message/send":
+                kind = "inbound"
+                meta = params.get("metadata") or {}
+                body = "".join(str(x.get("text") or "") for x in
+                               ((params.get("message") or {}).get("parts") or [])
+                               if str(x.get("kind") or "text") == "text").strip()
+                env = {"t": "inbound", "text": body,
+                       "task": meta.get("task"), "ctx": meta.get("from_ctx") or
+                       (params.get("message") or {}).get("contextId"),
+                       "hops": meta.get("hops") or 1, "from": meta.get("from")}
+            else:
+                _audit("hub_unknown_method", method=method)
+                return {"action": "skip", "reason": "relay:hub-unknown"}
+
             if kind in ("inbound", "answer"):
                 body = str(env.get("text") or "").strip()
                 store = _store()
@@ -917,15 +943,6 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
                 _audit("hub_inbound", task=task_id, ctx=env.get("ctx"), hop=env.get("hops"),
                        kind=kind, length=len(body))
                 return {"action": "skip", "reason": "relay:hub-inbound"}
-            if kind == "cancel":
-                store = _store()
-                with store.mutate() as state:
-                    for task in (state.get("tasks") or {}).values():
-                        if (task.get("hub_task") == str(env.get("task"))
-                                and not task_state.TaskStore.is_terminal(task)):
-                            task_state.TaskStore.transition(state, task["task_id"], "cancelled")
-                _audit("hub_cancel", hub_task=env.get("task"))
-                return {"action": "skip", "reason": "relay:hub-cancel"}
             _audit("hub_unknown_kind", kind=kind)
             return {"action": "skip", "reason": "relay:hub-unknown"}
 

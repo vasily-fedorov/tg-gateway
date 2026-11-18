@@ -22,22 +22,39 @@ relay в супергруппе (`group`) и тонкий провод к шлю
 
 ### Протокол hub ↔ агент
 
+Только JSON-RPC 2.0 (A2A v1.0-форма) поверх ЛС Telegram. Единственный формат —
+самодельных конвертов больше нет (совместимость с внешними не поддерживаем).
+
 Агент → хаб:
 
 ```json
-{"t": "relay", "to": "aa", "ctx": "", "hops": 1, "text": "сколько места на /?"}
-{"t": "reply", "task": "<hub task_id>", "verdict": "done", "text": "31 ГБ"}
-{"t": "reply", "task": "<hub task_id>", "verdict": "ask", "question": "какой диск?"}
-{"t": "reply", "task": "<hub task_id>", "verdict": "skip"}
+{"jsonrpc":"2.0","id":"r-1","method":"message/send","params":{
+  "message":{"role":"user","messageId":"m-1","contextId":"ab12",
+             "parts":[{"kind":"text","text":"сколько места на /?"}]},
+  "to":"aa","metadata":{"hops":1}}}
+{"jsonrpc":"2.0","id":"u-1","method":"tasks/update","params":{
+  "task":"3fe6f7","contextId":"ab12","status":{"state":"completed"},
+  "artifact":{"parts":[{"kind":"text","text":"31 ГБ"}]}}}
+{"jsonrpc":"2.0","id":"s-1","method":"tasks/get","params":{"id":"3fe6f7"}}
+{"jsonrpc":"2.0","id":"c-1","method":"tasks/cancel","params":{"id":"3fe6f7"}}
+{"jsonrpc":"2.0","id":"k-1","method":"agent/card","params":{"alias":"aa"}}
 ```
 
-Хаб → агент:
+Хаб → агент (доставка задачи, отмена, ответы на RPC):
 
 ```json
-{"t": "inbound", "task": "<id>", "ctx": "ab12", "hops": 2, "from": "god", "text": "..."}
-{"t": "answer",  "task": "<id>", "text": "ответ владельца на вопрос"}
-{"t": "cancel",  "task": "<id>", "ctx": "ab12", "hops": 2}
+{"jsonrpc":"2.0","id":"d-1","method":"message/send","params":{
+  "message":{"role":"user","messageId":"m-3fe6f7","contextId":"ab12",
+             "parts":[{"kind":"text","text":"..."}]},
+  "metadata":{"task":"3fe6f7","hops":2,"from":"god"}}}
+{"jsonrpc":"2.0","id":"c-1","method":"tasks/cancel","params":{"id":"3fe6f7"}}
+{"jsonrpc":"2.0","id":"r-1","result":{"task":{"id":"3fe6f7","status":{"state":"auth-required"}}}}
 ```
+
+Состояния по A2A: `auth-required` (ждём карточку владельца), `working`,
+`input-required`, `completed`, `failed`, `rejected`, `canceled`; наше `skipped`
+отдаётся как `completed` + `metadata.skipped`. Карточка владельцу = расширение
+(`capabilities.humanApproval: true`).
 
 Правила: `hop ≤ 3` (дальше отказ), `per_hour` на маршрут, `max_text`, фильтр секретов,
 карточка живёт 20 минут, продолжение по тому же `ctx` идёт без карточки при
