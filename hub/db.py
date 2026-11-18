@@ -125,14 +125,23 @@ class Db:
             self.conn.execute("UPDATE pair_codes SET used_at=? WHERE code=?", (now(), code.upper()))
         return row
 
+    def bot_owner(self, bot_id: int) -> int | None:
+        row = self.one("SELECT owner_tg FROM bots WHERE bot_id=?", (bot_id,))
+        return int(row["owner_tg"]) if row else None
+
+    def set_enabled(self, bot_id: int, enabled: bool) -> None:
+        self.conn.execute("UPDATE bots SET enabled=? WHERE bot_id=?", (1 if enabled else 0, bot_id))
+
     def pair_bot(self, *, bot_id: int, username: str, alias: str, owner: int,
-                 kind: str = "agent") -> None:
+                 kind: str = "agent") -> bool:
+        """False — если бот уже принадлежит другому владельцу (нужен /unpair)."""
         self.conn.execute(
             "INSERT INTO bots (bot_id, username, alias, owner_tg, kind, enabled, paired_at) "
             "VALUES (?,?,?,?,?,1,?) "
             "ON CONFLICT(bot_id) DO UPDATE SET username=excluded.username, alias=excluded.alias, "
             "owner_tg=excluded.owner_tg, kind=excluded.kind, enabled=1, paired_at=excluded.paired_at",
             (bot_id, username, alias, owner, kind, now()))
+        return True
 
     def bot_by_id(self, bot_id: int) -> Optional[sqlite3.Row]:
         return self.one("SELECT * FROM bots WHERE bot_id=? AND enabled=1", (bot_id,))

@@ -43,11 +43,12 @@ def envelope(**payload: Any) -> str:
 
 
 class Hub:
-    def __init__(self, token: str, db_path: pathlib.Path | str, owner_ids: Iterable[int],
-                 *, tg: Optional[Tg] = None, clock=time.time):
+    def __init__(self, token: str, db_path: pathlib.Path | str, owner_ids: Iterable[int] = (),
+                 *, tg: Optional[Tg] = None, clock=time.time, open_registration: bool = True):
         self.tg = tg or Tg(token)
         self.db = Db(db_path)
         self.owners = {int(x) for x in owner_ids}
+        self.open_registration = bool(open_registration)
         self.clock = clock
 
     # ── основной цикл ────────────────────────────────────────────────────────
@@ -82,8 +83,14 @@ class Hub:
         chat_id = chat.get("id")
         if frm.get("is_bot"):
             return self.on_agent(uid, frm.get("username") or str(uid), text, chat_id)
-        if uid in self.owners and chat.get("type") == "private":
+        if chat.get("type") != "private":
+            return None
+        if uid in self.owners or self.open_registration:
+            # Самостоятельная регистрация: у каждого владельца свой namespace
+            # (bots/routes/tasks фильтруются по owner_tg), чужие данные не видны.
+            self.db.ensure_owner(uid)
             return self.on_owner(uid, text)
+        self.say(chat_id, "Шлюз не открыт для новых владельцев.")
 
     # ── владелец ─────────────────────────────────────────────────────────────
     def on_owner(self, uid: int, text: str) -> None:
@@ -124,6 +131,16 @@ class Hub:
                 return self.say(uid, "Политика: ask или auto")
             self.db.set_route(uid, src, dst, policy=pol)
             return self.say(uid, f"Маршрут {src or 'вы'} → {dst}: {pol}")
+        if low.startswith("/unpair"):
+            parts = text.split()
+            if len(parts) < 2:
+                return self.say(uid, "Использование: /unpair <алиас>")
+            bot = self.db.bot_by_alias(uid, parts[1].strip())
+            if not bot:
+                return self.say(uid, "Такого бота нет.")
+            self.db.set_enabled(int(bot["bot_id"]), False)
+            self.db.event("bot_unpaired", owner=uid, alias=parts[1])
+            return self.say(uid, f"Бот «{parts[1]}» отключён.")
         if low.startswith("/cancel"):
             parts = text.split()
             if len(parts) < 2:
@@ -182,6 +199,10 @@ class Hub:
         if not row:
             return self.say(bot_id, "Код не найден или уже использован.")
         alias = (parts[2] if len(parts) > 2 else row["alias"]).strip()[:20]
+        current = self.db.bot_owner(bot_id)
+        if current is not None and current != int(row["owner_tg"]):
+            self.db.event("pair_conflict", owner=int(row["owner_tg"]), bot_id=bot_id)
+            return self.say(bot_id, "Бот уже подключён к другому владельцу.")
         self.db.pair_bot(bot_id=bot_id, username=username, alias=alias,
                          owner=int(row["owner_tg"]))
         self.db.event("bot_paired", owner=int(row["owner_tg"]), bot_id=bot_id, alias=alias)
@@ -307,7 +328,7 @@ class Hub:
         msg = cb.get("message") or {}
         chat_id = (msg.get("chat") or {}).get("id")
         msg_id = msg.get("message_id")
-        if uid not in self.owners:
+        if uid not in self.owners and not self.db.owner(uid):
             return self.tg.answer_callback(cb_id, "Нет прав")
         parts = data.split(":")
         if len(parts) != 3 or parts[0] != "hub":
@@ -316,6 +337,11 @@ class Hub:
         task = self.db.task(task_id)
         if not task:
             self.tg.answer_callback(cb_id, "Задача не найдена")
+            return self.finish_card(chat_id, msg_id, "⌛ Задача неактивна.")
+        if int(task["owner_tg"]) != uid:  # чужую карточку подтверждать нельзя
+            self.db.event("card_unauthorized", task_id=task_id, owner=uid)
+            self.tg.answer_callback(cb_id, "Нет прав")
+            return self.finish_card(chat_id, msg_id, "⛔ Нет прав.")
             return self.finish_card(chat_id, msg_id, "⌛ Задача неактивна.")
         if task["status"] in TERMINAL:
             self.tg.answer_callback(cb_id, "Уже закрыта")
@@ -360,7 +386,9 @@ def main() -> int:
         print("нужны TG_GATEWAY_TOKEN и TG_GATEWAY_OWNERS", file=sys.stderr)
         return 2
     db_path = os.environ.get("TG_GATEWAY_DB", str(pathlib.Path.home() / "tg-gateway/hub.sqlite3"))
-    hub = Hub(token, db_path, [int(x) for x in owners.split(",") if x.strip()])
+    open_reg = os.environ.get("TG_GATEWAY_OPEN", "1").strip().lower() not in ("0", "false", "no")
+    hub = Hub(token, db_path, [int(x) for x in owners.split(",") if x.strip()],
+              open_registration=open_reg)
     print(f"hub: db={db_path} owners={sorted(hub.owners)}", flush=True)
     hub.run()
     return 0

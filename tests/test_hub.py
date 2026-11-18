@@ -194,6 +194,62 @@ def run() -> dict:
     assert hub.db.task(task_id)["status"] == "failed"
     res["card_ttl"] = True
 
+    # 10b. мультитенантность: второй владелец, те же алиасы
+    OWNER_B = 777000111
+    BOT_B = 8727385599
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.handle(msg(OWNER_B, "/start"))
+    assert hub.db.owner(OWNER_B), "новый владелец должен регистрироваться сам"
+    hub.handle(msg(OWNER_B, "/pair god"))
+    code_b = [ln for ln in tg.sent[-1]["text"].splitlines() if ln.startswith("/pair ")][0]
+    hub.handle(msg(BOT_B, code_b, is_bot=True, username="owner_b_bot"))
+    assert int(hub.db.bot_by_id(BOT_B)["owner_tg"]) == OWNER_B
+    assert hub.db.bot_by_id(BOT_B)["alias"] == "god"
+    tg.sent.clear()
+    hub.handle(msg(OWNER, "/bots"))
+    assert "owner_b_bot" not in tg.sent[-1]["text"]
+    hub.handle(msg(OWNER_B, "/bots"))
+    assert "owner_b_bot" in tg.sent[-1]["text"] and "gateway_beta" not in tg.sent[-1]["text"]
+    res["multi_tenant_isolation"] = True
+
+    # 10c. чужая карточка не подтверждается
+    hub.db.set_route(OWNER, "god", "aa", policy="ask")
+    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "только для A"}),
+                   is_bot=True, username="god"))
+    card = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
+    task_a = card["buttons"][0][0][1].split(":")[2]
+    before = len(envelopes(tg, AA))
+    hub.handle(cb(OWNER_B, f"hub:ok:{task_a}"))
+    assert len(envelopes(tg, AA)) == before, "чужой клик не должен отправлять"
+    assert hub.db.task(task_a)["status"] == "submitted"
+    assert any(ev["kind"] == "card_unauthorized" for ev in hub.db.q("SELECT * FROM events"))
+    hub.handle(cb(OWNER, f"hub:ok:{task_a}"))
+    assert len(envelopes(tg, AA)) == before + 1
+    res["cross_tenant_click_denied"] = True
+
+    # 10d. один бот — один владелец; /unpair освобождает
+    hub.handle(msg(OWNER_B, "/pair god"))
+    code_b2 = [ln for ln in tg.sent[-1]["text"].splitlines() if ln.startswith("/pair ")][0]
+    hub.handle(msg(GOD, code_b2, is_bot=True, username="someone"))
+    assert int(hub.db.bot_by_id(GOD)["owner_tg"]) == OWNER, "перепривязка запрещена"
+    hub.handle(msg(OWNER, "/unpair aa"))
+    assert not hub.db.bot_by_alias(OWNER, "aa")
+    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "x"}),
+                   is_bot=True, username="god"))
+    assert any("Нет бота" in x["text"] for x in tg.sent), tg.sent[-1]
+    res["bot_single_owner_and_unpair"] = True
+
+    # 10e. закрытая регистрация
+    tmp2 = Path(tempfile.mkdtemp(prefix="hub-closed-"))
+    tg2 = FakeTg()
+    closed = Hub("TOKEN", tmp2 / "hub.sqlite3", [OWNER], tg=tg2, open_registration=False)
+    closed.handle(msg(999000111, "/start"))
+    assert not closed.db.owner(999000111)
+    assert any("не открыт" in x["text"] for x in tg2.sent)
+    res["closed_registration"] = True
+
     # 11. policy-функции
     assert policy.needs_approval(policy="ask", ctx="", hops=1, direction="relay") is True
     assert policy.needs_approval(policy="auto", ctx="ab12", hops=2, direction="reply") is False
