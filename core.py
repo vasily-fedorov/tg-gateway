@@ -914,9 +914,19 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
             if method == "message/send":
                 kind = "inbound"
                 meta = params.get("metadata") or {}
-                body = "".join(str(x.get("text") or "") for x in
-                               ((params.get("message") or {}).get("parts") or [])
-                               if str(x.get("kind") or "text") == "text").strip()
+                _parts = ((params.get("message") or {}).get("parts") or [])
+                _chunks, _files = [], []
+                for _p in _parts:
+                    _kind = str(_p.get("kind") or "text")
+                    if _kind == "text":
+                        _chunks.append(str(_p.get("text") or ""))
+                    elif _kind == "data":
+                        _chunks.append(json.dumps(_p.get("data") or {}, ensure_ascii=False))
+                    elif _kind == "file":
+                        _info = _p.get("file") or {}
+                        _files.append(str(_info.get("name") or _info.get("uri") or "file"))
+                        _chunks.append(f"[файл: {_files[-1]}]")
+                body = "\n".join(x.strip() for x in _chunks if x.strip()).strip()
                 env = {"t": "inbound", "text": body,
                        "task": meta.get("task"), "ctx": meta.get("from_ctx") or
                        (params.get("message") or {}).get("contextId"),

@@ -111,12 +111,21 @@ class Db:
         self._migrate()
 
     def _migrate(self) -> None:
+        tcols = {r["name"] for r in self.q("PRAGMA table_info(tasks)")}
+        if "attachments" not in tcols:
+            self.conn.execute("ALTER TABLE tasks ADD COLUMN attachments TEXT")
         cols = {r["name"] for r in self.q("PRAGMA table_info(bots)")}
         if "description" not in cols:
             self.conn.execute("ALTER TABLE bots ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS inbox_msgs (message_id TEXT PRIMARY KEY, task_id TEXT, "
             "created_at REAL NOT NULL)")
+        cols = {r["name"] for r in self.q("PRAGMA table_info(inbox_msgs)")}
+        if "fingerprint" not in cols:
+            self.conn.execute("ALTER TABLE inbox_msgs ADD COLUMN fingerprint TEXT")
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS peer_health (alias TEXT PRIMARY KEY, failures INTEGER NOT NULL "
+            "DEFAULT 0, blocked_until REAL NOT NULL DEFAULT 0, last_error TEXT, updated_at REAL NOT NULL)")
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def q(self, sql: str, args: tuple = ()) -> List[sqlite3.Row]:
@@ -182,9 +191,46 @@ class Db:
         row = self.one("SELECT task_id FROM inbox_msgs WHERE message_id=?", (message_id,))
         return row["task_id"] if row else None
 
-    def remember_message(self, message_id: str, task_id: str) -> None:
-        self.conn.execute("INSERT OR REPLACE INTO inbox_msgs (message_id, task_id, created_at) "
-                          "VALUES (?,?,?)", (message_id, task_id, now()))
+    def remember_message(self, message_id: str, task_id: str, fingerprint: str = "") -> None:
+        self.conn.execute("INSERT OR REPLACE INTO inbox_msgs (message_id, task_id, created_at, "
+                          "fingerprint) VALUES (?,?,?,?)", (message_id, task_id, now(), fingerprint))
+
+    def seen_fingerprint(self, fingerprint: str, window_s: float = 300.0) -> Optional[str]:
+        """Тот же текст от того же отправителя за окно — уже обрабатывали."""
+        row = self.one("SELECT task_id FROM inbox_msgs WHERE fingerprint=? AND created_at > ?",
+                       (fingerprint, now() - window_s))
+        return row["task_id"] if row else None
+
+    # ── здоровье пиров ───────────────────────────────────────────────────────
+    def peer_state(self, alias: str) -> sqlite3.Row:
+        row = self.one("SELECT * FROM peer_health WHERE alias=?", (alias,))
+        if row is None:
+            self.conn.execute("INSERT INTO peer_health (alias, updated_at) VALUES (?,?)",
+                              (alias, now()))
+            row = self.one("SELECT * FROM peer_health WHERE alias=?", (alias,))
+        return row
+
+    def peer_ok(self, alias: str) -> None:
+        self.conn.execute("UPDATE peer_health SET failures=0, blocked_until=0, last_error=NULL, "
+                          "updated_at=? WHERE alias=?", (now(), alias))
+
+    def peer_failed(self, alias: str, error: str, *, threshold: int = 3,
+                    block_s: float = 300.0) -> bool:
+        """True — пир только что заблокирован."""
+        row = self.peer_state(alias)
+        failures = int(row["failures"]) + 1
+        blocked = 0.0
+        if failures >= threshold:
+            blocked = now() + block_s
+            failures = 0
+        self.conn.execute("UPDATE peer_health SET failures=?, blocked_until=?, last_error=?, "
+                          "updated_at=? WHERE alias=?",
+                          (failures, blocked, error[:200], now(), alias))
+        return bool(blocked)
+
+    def peer_blocked(self, alias: str) -> float:
+        row = self.peer_state(alias)
+        return float(row["blocked_until"] or 0.0)
 
     def set_description(self, owner: int, alias: str, text: str) -> bool:
         bot = self.bot_by_alias(owner, alias)
@@ -259,14 +305,15 @@ class Db:
     # ── tasks ────────────────────────────────────────────────────────────────
     def create_task(self, *, task_id: str, owner: int, direction: str, ctx: str, hops: int,
                     src: str, dst: str, text: str, status: str = "submitted",
-                    card_chat: int | None = None, card_msg: int | None = None) -> None:
+                    card_chat: int | None = None, card_msg: int | None = None,
+                    attachments: str | None = None) -> None:
         ts = now()
         self.conn.execute(
             "INSERT INTO tasks (task_id, owner_tg, direction, ctx, hops, src_alias, dst_alias, "
-            "text, status, card_chat, card_msg, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "text, status, card_chat, card_msg, created_at, updated_at, attachments) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, owner, direction, ctx, hops, src, dst, text, status, card_chat, card_msg,
-             ts, ts))
+             ts, ts, attachments))
 
     def update_task(self, task_id: str, **fields: Any) -> None:
         if not fields:

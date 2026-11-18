@@ -444,6 +444,74 @@ def run() -> dict:
     assert hub.db.task("deep1")["status"] == "failed"
     res["hop_budget_blocks_4th"] = True
 
+    # 10k. TTL конверта, отпечаток, вложения, поллинг, здоровье пира
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.db.set_route(OWNER, "god", "aa", policy="auto")
+
+    # просроченный конверт
+    old_ts = 1_000_000.0
+    hub.handle(msg(GOD, json.dumps({"jsonrpc": "2.0", "id": "t1", "method": "message/send",
+                                    "params": {"message": {"role": "user", "messageId": "ttl-1",
+                                                           "parts": [{"kind": "text", "text": "старое"}]},
+                                               "to": "aa",
+                                               "metadata": {"sent_at": old_ts}}}),
+                   is_bot=True, username="god"))
+    last = json.loads(tg.sent[-1]["text"])
+    assert last.get("error", {}).get("code") == -32602, last
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='ttl_rejected'")
+    res["envelope_ttl"] = True
+
+    # отпечаток: тот же текст с новым messageId
+    send_relay(hub, "один и тот же текст", message_id="fp-1")
+    first_task = hub.db.q("SELECT task_id FROM tasks WHERE text='один и тот же текст'")[0]["task_id"]
+    send_relay(hub, "один и тот же текст", message_id="fp-2")
+    dup = json.loads(tg.sent[-1]["text"])
+    assert dup["result"]["deduplicated"] is True, dup
+    assert dup["result"]["task"]["id"] == first_task
+    res["fingerprint_dedupe"] = True
+
+    # вложения: data-часть доезжает до пира как data-часть
+    hub.handle(msg(GOD, json.dumps({"jsonrpc": "2.0", "id": "a1", "method": "message/send",
+                                    "params": {"message": {"role": "user", "messageId": "att-1",
+                                                           "parts": [{"kind": "text", "text": "смотри"},
+                                                                     {"kind": "data",
+                                                                      "data": {"disk": {"free_gb": 31}}}]},
+                                               "to": "aa"}}), is_bot=True, username="god"))
+    att_card = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
+    att_task = att_card["buttons"][0][0][1].split(":")[2]
+    hub.handle(cb(OWNER, f"hub:ok:{att_task}"))
+    wire = [json.loads(x["text"]) for x in tg.sent
+            if x["chat"] == AA and x["text"].startswith("{") and "method" in json.loads(x["text"])]
+    assert wire[-1]["params"]["message"]["parts"][1]["kind"] == "data", wire[-1]
+    res["data_part_delivered"] = True
+
+    # поллинг: tasks/list по курсору
+    since = 0.0
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "p1", "method": "tasks/list",
+                                   "params": {"since": since}}), is_bot=True, username="aa"))
+    poll = json.loads(tg.sent[-1]["text"])["result"]
+    assert poll["tasks"] and poll["cursor"] > 0, poll
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "p2", "method": "tasks/list",
+                                   "params": {"since": poll["cursor"]}}), is_bot=True, username="aa"))
+    assert json.loads(tg.sent[-1]["text"])["result"]["tasks"] == []
+    res["tasks_list_polling"] = True
+
+    # здоровье пира: 3 неудачи → доставка блокируется
+    hub.db.pair_bot(bot_id=999000777, username="dead_bot", alias="dead", owner=OWNER)
+    for _ in range(3):
+        hub.db.peer_failed("dead", "boom")
+    assert hub.db.peer_blocked("dead") > hub.clock()
+    hub.db.create_task(task_id="dead1", owner=OWNER, direction="relay", ctx="x", hops=1,
+                       src="god", dst="dead", text="в пустоту", status="working")
+    assert hub.deliver("dead1") is False
+    assert hub.db.task("dead1")["status"] == "failed"
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='peer_blocked'")
+    hub.db.peer_ok("dead")
+    assert hub.db.peer_blocked("dead") == 0
+    res["peer_health_circuit"] = True
+
     # старый самодельный конверт больше не принимается
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),

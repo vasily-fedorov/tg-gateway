@@ -25,6 +25,32 @@ SHELL_PATTERNS = (
 )
 
 
+DEFAULT_TTL_S = 300.0
+FINGERPRINT_WINDOW_S = 300.0
+
+
+def fingerprint(*, src: str, dst: str, text: str) -> str:
+    """Отпечаток содержимого: ловит повтор того же текста с новым messageId."""
+    import hashlib
+    raw = f"{src}:{dst}:{' '.join(str(text or '').split())}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def ttl_error(*, sent_at: Optional[float], ttl_seconds: Optional[float], now: float) -> Optional[str]:
+    """Просроченный конверт не принимаем (аналог ttl_seconds из A2A-TG)."""
+    ttl = float(ttl_seconds or DEFAULT_TTL_S)
+    if ttl <= 0:
+        ttl = DEFAULT_TTL_S
+    if sent_at is None:
+        return None            # отправитель не прислал метку — доверяем доставке Telegram
+    age = now - float(sent_at)
+    if age > ttl:
+        return f"конверт просрочен: {int(age)}s > ttl {int(ttl)}s"
+    if age < -ttl:
+        return "метка времени из будущего"
+    return None
+
+
 def scan_text(text: str) -> Optional[str]:
     """Причина отказа или None."""
     for name, rx in SECRET_PATTERNS:

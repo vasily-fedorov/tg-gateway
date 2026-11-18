@@ -302,15 +302,36 @@ class Hub:
         if method in ("message/send", "message/stream"):
             msg = params.get("message") or {}
             parts = msg.get("parts") or []
-            text = "".join(str(p.get("text") or "") for p in parts
-                           if str(p.get("kind") or "text") == "text").strip()
+            text_parts, attachments = [], []
+            for part in parts:
+                kind = str(part.get("kind") or "text")
+                if kind == "text":
+                    text_parts.append(str(part.get("text") or ""))
+                elif kind == "data":
+                    text_parts.append(json.dumps(part.get("data") or {}, ensure_ascii=False))
+                    attachments.append(part)
+                elif kind == "file":
+                    file_info = part.get("file") or {}
+                    name = str(file_info.get("name") or file_info.get("uri") or "file")
+                    text_parts.append(f"[файл: {name}]")
+                    attachments.append(part)
+            text = "\n".join(x.strip() for x in text_parts if x.strip()).strip()
             message_id = str(msg.get("messageId") or "")
             ctx = str(msg.get("contextId") or "")
-            hops = int((params.get("metadata") or {}).get("hops") or 1)
+            meta = params.get("metadata") or {}
+            hops = int(meta.get("hops") or 1)
+            # TTL конверта (A2A-TG): просроченное не принимаем
+            ttl_err = policy.ttl_error(sent_at=meta.get("sent_at"),
+                                      ttl_seconds=params.get("ttl_seconds") or meta.get("ttl_seconds"),
+                                      now=self.clock())
+            if ttl_err:
+                self.db.event("ttl_rejected", owner=owner, reason=ttl_err)
+                return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_INVALID_PARAMS, ttl_err))
             to_alias = str(msg.get("to") or params.get("to") or "").strip()
             if not to_alias:
                 return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_INVALID_PARAMS,
                                                     "нужен params.message.to (алиас)"))
+            fp = policy.fingerprint(src=str(bot["alias"]), dst=to_alias, text=text)
             if message_id:
                 seen = self.db.seen_message(message_id)
                 if seen:
@@ -319,10 +340,18 @@ class Hub:
                     if task:
                         return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task),
                                                                    "deduplicated": True}))
+            dup = self.db.seen_fingerprint(fp, window_s=policy.FINGERPRINT_WINDOW_S)
+            if dup:
+                task = self.db.task(dup)
+                self.db.event("rpc_dedup_fingerprint", task_id=dup, owner=owner)
+                if task:
+                    return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task),
+                                                               "deduplicated": True}))
             before = {r["task_id"] for r in self.db.q(
                 "SELECT task_id FROM tasks WHERE owner_tg=? ORDER BY created_at DESC LIMIT 5",
                 (owner,))}
-            self.on_relay(bot, {"to": to_alias, "text": text, "ctx": ctx, "hops": hops})
+            self.on_relay(bot, {"to": to_alias, "text": text, "ctx": ctx, "hops": hops,
+                                "attachments": attachments})
             fresh = [r for r in self.db.q(
                 "SELECT * FROM tasks WHERE owner_tg=? ORDER BY created_at DESC LIMIT 3", (owner,))
                 if r["task_id"] not in before]
@@ -331,7 +360,7 @@ class Hub:
                                                     self._last_refusal or "запрос отклонён"))
             task = fresh[0]
             if message_id:
-                self.db.remember_message(message_id, task["task_id"])
+                self.db.remember_message(message_id, task["task_id"], fp)
             return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task)}))
 
         if method in ("tasks/update", "tasks/status"):
@@ -367,6 +396,18 @@ class Hub:
                                 "text": text, "question": question})
             fresh = self.db.task(task_id)
             return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(fresh)}))
+
+        if method in ("tasks/list", "tasks/poll"):
+            since = float(params.get("since") or 0)
+            alias = str(bot["alias"])
+            limit = int(params.get("limit") or 50)
+            rows = self.db.q(
+                "SELECT * FROM tasks WHERE owner_tg=? AND updated_at > ? "
+                "AND (src_alias=? OR dst_alias=?) ORDER BY updated_at LIMIT ?",
+                (owner, since, alias, alias, limit))
+            cursor = max([float(r["updated_at"]) for r in rows], default=since)
+            return self.say(bot_id, rpc.rpc_ok(rpc_id, {
+                "tasks": [rpc.task_view(r) for r in rows], "cursor": cursor}))
 
         if method == "tasks/get":
             task = self.db.task(str(params.get("id") or ""))
@@ -449,7 +490,9 @@ class Hub:
         stored_dst = f"@{target['username']}" if link else dst_alias
         self.db.create_task(task_id=task_id, owner=owner, direction="relay", ctx=ctx,
                             hops=hops, src=bot["alias"], dst=stored_dst, text=text,
-                            status="submitted" if approve else "working")
+                            status="submitted" if approve else "working",
+                            attachments=json.dumps(env.get("attachments") or [],
+                                                   ensure_ascii=False))
         self.db.event("relay_parked" if approve else "relay_auto", task_id=task_id, owner=owner,
                       src=bot["alias"], dst=dst_alias, hops=hops, ctx=ctx, length=len(text))
         if approve:
@@ -496,6 +539,12 @@ class Hub:
             self.db.update_task(task_id, status="failed")
             self.db.event("deliver_failed", task_id=task_id, reason="no_target")
             return False
+        dst_alias = str(task["dst_alias"])
+        blocked_until = self.db.peer_blocked(dst_alias)
+        if blocked_until > self.clock():
+            self.db.update_task(task_id, status="failed")
+            self.db.event("peer_blocked", task_id=task_id, to=dst_alias, until=blocked_until)
+            return False
         hops = int(task["hops"]) + 1
         if hops > policy.MAX_HOPS:
             # Бюджет глубины: 4-е сообщение в цепочке не доставляем вообще.
@@ -504,19 +553,28 @@ class Hub:
             self.say(int(task["owner_tg"]),
                      f"⛔ Предел глубины ({policy.MAX_HOPS}): задача {task_id} остановлена.")
             return False
+        parts = [{"kind": "text", "text": task["text"] or ""}]
+        try:
+            parts.extend(json.loads(task["attachments"] or "[]"))
+        except ValueError:
+            pass
         payload = {
             "jsonrpc": "2.0", "id": "d-" + new_id(4), "method": "message/send",
             "params": {
                 "message": {"role": "user", "messageId": "m-" + task_id,
-                            "contextId": task["ctx"],
-                            "parts": [{"kind": "text", "text": task["text"] or ""}]},
-                "metadata": {"task": task_id, "hops": hops, "from": task["src_alias"]},
+                            "contextId": task["ctx"], "parts": parts},
+                "metadata": {"task": task_id, "hops": hops, "from": task["src_alias"],
+                             "sent_at": self.clock()},
             },
         }
         ok, res = self.tg.send(int(target["bot_id"]),
                                json.dumps(payload, ensure_ascii=False))
         status = "working" if ok else "failed"
         self.db.update_task(task_id, status=status, hops=hops)
+        if ok:
+            self.db.peer_ok(dst_alias)
+        elif self.db.peer_failed(dst_alias, str(res)):
+            self.db.event("peer_circuit_open", task_id=task_id, to=dst_alias)
         self.db.event("delivered" if ok else "deliver_failed", task_id=task_id,
                       to=task["dst_alias"], hops=hops, error=None if ok else str(res)[:200])
         return bool(ok)

@@ -281,6 +281,19 @@ def run() -> dict:
     assert not cards, "в endpoint-режиме карточек нет"
     ep = [t for t in tasks("in") if t.get("hub_task") == "hub42"]
     assert ep and ep[-1]["status"] == "working", ep
+    # data-часть превращается в текст для модели
+    withdata = json.dumps({"jsonrpc": "2.0", "id": "d-3", "method": "message/send",
+                           "params": {"message": {"role": "user", "messageId": "m-3",
+                                                  "parts": [{"kind": "text", "text": "данные:"},
+                                                            {"kind": "data",
+                                                             "data": {"free_gb": 31}}]},
+                                      "metadata": {"task": "hub77", "hops": 1, "from": "aa"}}})
+    asyncio.run(call(make_event(withdata, is_bot=True, user_id=HUB_ID, thread_id=None)))
+    got = [t for t in tasks("in") if t.get("hub_task") == "hub77"]
+    assert got and "free_gb" in got[-1]["text"], got
+    with store.mutate() as st:   # чтобы не попала в следующий drain
+        mod.task_state.TaskStore.transition(st, got[-1]["task_id"], "cancelled")
+
     # старый конверт больше не принимается
     legacy = json.dumps({"t": "inbound", "task": "x", "ctx": "c", "hops": 1,
                          "from": "aa", "text": "старый формат"})
