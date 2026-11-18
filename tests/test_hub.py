@@ -53,10 +53,12 @@ def cb(uid: int, data: str, *, message_id: int = 1):
                                "message": {"message_id": message_id, "chat": {"id": OWNER}}}}
 
 
-def new_hub() -> tuple[Hub, FakeTg]:
+def new_hub(open_registration: bool = True) -> tuple[Hub, FakeTg]:
+    """Тестам нужен открытый шлюз (несколько владельцев); прод по умолчанию закрыт."""
     tmp = Path(tempfile.mkdtemp(prefix="hub-"))
     tg = FakeTg()
-    hub = Hub("TOKEN", tmp / "hub.sqlite3", [OWNER], tg=tg)
+    hub = Hub("TOKEN", tmp / "hub.sqlite3", [OWNER], tg=tg,
+              open_registration=open_registration)
     hub.db.ensure_owner(OWNER)
     return hub, tg
 
@@ -247,8 +249,19 @@ def run() -> dict:
     closed = Hub("TOKEN", tmp2 / "hub.sqlite3", [OWNER], tg=tg2, open_registration=False)
     closed.handle(msg(999000111, "/start"))
     assert not closed.db.owner(999000111)
-    assert any("не открыт" in x["text"] for x in tg2.sent)
+    assert any("закрыт" in x["text"] for x in tg2.sent)
     res["closed_registration"] = True
+
+    # 10f. по умолчанию шлюз закрыт: посторонний не станет владельцем
+    tmp3 = Path(tempfile.mkdtemp(prefix="hub-default-"))
+    tg3 = FakeTg()
+    default_hub = Hub("TOKEN", tmp3 / "hub.sqlite3", [OWNER], tg=tg3)
+    default_hub.handle(msg(555000111, "/start"))
+    assert not default_hub.db.owner(555000111)
+    assert any("закрыт" in x["text"] for x in tg3.sent), tg3.sent
+    default_hub.handle(msg(OWNER, "/bots"))
+    assert default_hub.db.owner(OWNER), "владелец из allowlist работает"
+    res["closed_by_default"] = True
 
     # 11. policy-функции
     assert policy.needs_approval(policy="ask", ctx="", hops=1, direction="relay") is True

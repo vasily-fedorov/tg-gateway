@@ -54,8 +54,9 @@ relay в супергруппе (`group`) и тонкий провод к шлю
   отклоняется (`card_unauthorized`);
 - бот принадлежит ровно одному владельцу (`bots.bot_id` — PK); попытка привязать
   чужого бота отклоняется, освобождает `/unpair <алиас>`;
-- новый владелец регистрируется сам (`/start`), пока `TG_GATEWAY_OPEN=1`; при
-  `TG_GATEWAY_OPEN=0` работают только `TG_GATEWAY_OWNERS`.
+- доступ закрыт по умолчанию: работают только tg_id из `TG_GATEWAY_OWNERS`
+  (`TG_GATEWAY_OPEN=0`); открытая регистрация (`/start`) — только если явно
+  выставить `TG_GATEWAY_OPEN=1`.
 
 Чего в MVP нет: квот на владельца, приглашений «только по коду», выгрузки аудита per
 tenant. Хаб по конструкции видит текст сообщений (он и есть доверенный посредник).
@@ -79,6 +80,7 @@ mkdir -p ~/tg-gateway && chmod 700 ~/tg-gateway
 cat > ~/tg-gateway/.env <<'EOF'
 TG_GATEWAY_TOKEN=<токен бота-хаба>
 TG_GATEWAY_OWNERS=100000001
+TG_GATEWAY_OPEN=0
 TG_GATEWAY_DB=/home/user/tg-gateway/hub.sqlite3
 EOF
 chmod 600 ~/tg-gateway/.env

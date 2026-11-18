@@ -28,6 +28,7 @@ HELP = (
     "/routes — маршруты и политика\n"
     "/route <от> <кому> ask|auto — политика подтверждений ('-' = вы)\n"
     "/cancel <задача> — отменить задачу\n"
+    "/unpair <алиас> — отключить бота (бот освобождается)\n"
     "/help — это сообщение\n\n"
     "Всё, что бот присылает вам на подтверждение, приходит карточкой сюда.\n"
     "Ответ на вопрос бота — просто текстом в ответ на карточку."
@@ -44,7 +45,7 @@ def envelope(**payload: Any) -> str:
 
 class Hub:
     def __init__(self, token: str, db_path: pathlib.Path | str, owner_ids: Iterable[int] = (),
-                 *, tg: Optional[Tg] = None, clock=time.time, open_registration: bool = True):
+                 *, tg: Optional[Tg] = None, clock=time.time, open_registration: bool = False):
         self.tg = tg or Tg(token)
         self.db = Db(db_path)
         self.owners = {int(x) for x in owner_ids}
@@ -90,7 +91,8 @@ class Hub:
             # (bots/routes/tasks фильтруются по owner_tg), чужие данные не видны.
             self.db.ensure_owner(uid)
             return self.on_owner(uid, text)
-        self.say(chat_id, "Шлюз не открыт для новых владельцев.")
+        self.say(chat_id, "Этот шлюз закрыт: доступ только у владельца, "
+                          "указанного в TG_GATEWAY_OWNERS.")
 
     # ── владелец ─────────────────────────────────────────────────────────────
     def on_owner(self, uid: int, text: str) -> None:
@@ -386,7 +388,8 @@ def main() -> int:
         print("нужны TG_GATEWAY_TOKEN и TG_GATEWAY_OWNERS", file=sys.stderr)
         return 2
     db_path = os.environ.get("TG_GATEWAY_DB", str(pathlib.Path.home() / "tg-gateway/hub.sqlite3"))
-    open_reg = os.environ.get("TG_GATEWAY_OPEN", "1").strip().lower() not in ("0", "false", "no")
+    # По умолчанию шлюз ЗАКРЫТ: работают только TG_GATEWAY_OWNERS.
+    open_reg = os.environ.get("TG_GATEWAY_OPEN", "0").strip().lower() in ("1", "true", "yes")
     hub = Hub(token, db_path, [int(x) for x in owners.split(",") if x.strip()],
               open_registration=open_reg)
     print(f"hub: db={db_path} owners={sorted(hub.owners)}", flush=True)

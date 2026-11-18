@@ -10,7 +10,7 @@ mkdir -p "$DATA" "$UNIT_DIR"
 chmod 700 "$DATA"
 
 if [ ! -f "$DATA/.env" ]; then
-  echo "создайте $DATA/.env: TG_GATEWAY_TOKEN, TG_GATEWAY_OWNERS, TG_GATEWAY_DB" >&2
+  echo "создайте $DATA/.env: TG_GATEWAY_TOKEN, TG_GATEWAY_OWNERS, TG_GATEWAY_OPEN=0, TG_GATEWAY_DB" >&2
   exit 1
 fi
 chmod 600 "$DATA/.env"
