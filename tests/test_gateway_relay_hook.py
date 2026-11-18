@@ -354,6 +354,19 @@ def run() -> dict:
     view = json.loads(mod.tool_status({"task_id": "t1"}))
     assert view["task"]["status"]["state"] == "completed", view
     res["endpoint_relay_status"] = True
+
+    # relay_protocol: текст протокола приходит из хаба
+    def fake_proto(text: str) -> bool:
+        env = json.loads(text)
+        with store.mutate() as st:
+            st.setdefault("rpc", {})[env["id"]] = {
+                "jsonrpc": "2.0", "id": env["id"],
+                "result": {"protocol": "TG-GATEWAY · протокол агента (v1)"}}
+        return True
+
+    mod._to_hub = fake_proto
+    assert "протокол агента" in mod.tool_protocol({})
+    res["endpoint_relay_protocol"] = True
     mod._routes = base_routes
 
     # 19. the quiet-turn reply parsing still works

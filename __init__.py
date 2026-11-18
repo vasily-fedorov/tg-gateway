@@ -29,6 +29,13 @@ _SEND_SCHEMA = {
     },
 }
 
+_PROTOCOL_SCHEMA = {
+    "name": "relay_protocol",
+    "description": ("Протокол tg-gateway в формате для агента: какие сообщения приходят, "
+                    "как отвечать, какие методы и правила. Вызови, если не уверен в формате."),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
 _STATUS_SCHEMA = {
     "name": "relay_status",
     "description": ("Статус задачи в хабе (A2A tasks/get): состояние, вопрос, артефакт. "
@@ -119,6 +126,9 @@ def register(ctx) -> None:
     ctx.register_tool(name="relay_send", toolset="gateway_relay",
                       schema=_SEND_SCHEMA, handler=core.tool_send,
                       description="Relay via an owner-approved card", emoji="\u2709")
+    ctx.register_tool(name="relay_protocol", toolset="gateway_relay",
+                      schema=_PROTOCOL_SCHEMA, handler=core.tool_protocol,
+                      description="Agent-facing protocol text", emoji="\U0001f4d8")
     ctx.register_tool(name="relay_status", toolset="gateway_relay",
                       schema=_STATUS_SCHEMA, handler=core.tool_status,
                       description="Task status via hub", emoji="\U0001f50e")

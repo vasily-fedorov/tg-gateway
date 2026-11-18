@@ -512,6 +512,26 @@ def run() -> dict:
     assert hub.db.peer_blocked("dead") == 0
     res["peer_health_circuit"] = True
 
+    # владелец: /log по боту, /task, /protocol, RPC agent/protocol
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    send_relay(hub, "задача для aa")
+    hub.handle(msg(OWNER, "/log aa"))
+    log_out = tg.sent[-1]["text"]
+    assert "aa" in log_out and "задача для aa" in log_out, log_out
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='owner_log'")
+    hub.handle(msg(OWNER, "/log god"))
+    assert "god→aa" in tg.sent[-1]["text"], tg.sent[-1]["text"]
+    task_id = hub.db.q("SELECT task_id FROM tasks ORDER BY created_at DESC LIMIT 1")[0]["task_id"]
+    hub.handle(msg(OWNER, f"/task {task_id}"))
+    assert task_id in tg.sent[-1]["text"] and "состояние" in tg.sent[-1]["text"]
+    hub.handle(msg(OWNER, "/protocol"))
+    assert "message/send" in tg.sent[-1]["text"] and "tasks/update" in tg.sent[-1]["text"]
+    rpc_proto = rpc_call("pp-1", "agent/protocol", {})
+    assert "TG-GATEWAY" in rpc_proto["result"]["protocol"]
+    res["owner_log_task_protocol"] = True
+
     # старый самодельный конверт больше не принимается
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),

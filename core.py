@@ -805,6 +805,17 @@ def tool_cancel(args: Dict[str, Any], **kwargs: Any) -> str:
     return json.dumps({"status": "cancel_pending", "task_id": task_id}, ensure_ascii=False)
 
 
+def tool_protocol(args: Dict[str, Any], **kwargs: Any) -> str:
+    """Протокол в формате для агента (хаб — единственный источник истины)."""
+    if _hub_cfg():
+        res = _hub_rpc("agent/protocol", {})
+        if "protocol" in res:
+            return str(res["protocol"])
+        return json.dumps(res, ensure_ascii=False)
+    return ("Профиль не в endpoint-режиме: реле ведёт карточки в супергруппе, "
+            "см. README плагина.")
+
+
 def tool_status(args: Dict[str, Any], **kwargs: Any) -> str:
     """Статус задачи у хаба (A2A tasks/get)."""
     task_id = str(args.get("task_id") or "").strip()

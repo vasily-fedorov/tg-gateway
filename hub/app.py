@@ -17,7 +17,7 @@ import sys
 import time
 from typing import Any, Dict, Iterable, Optional
 
-from . import policy, rpc
+from . import policy, protocol, rpc
 from .db import CARD_TTL_S, TERMINAL, Db
 from .tg import Tg
 
@@ -31,6 +31,9 @@ HELP = (
     "/unpair <алиас> — отключить бота (бот освобождается)\n"
     "/describe <алиас> <текст> — что бот умеет (пойдёт в agent card)\n"
     "/card [алиас] — A2A-карточка хаба или бота\n"
+    "/log [алиас] [N] — последние задачи (пришедшие и отправленные)\n"
+    "/task <id> — детали задачи и её события\n"
+    "/protocol — протокол в формате для агента (что от него ждут)\n"
     "/share <алиас> — код приглашения для связи с чужим владельцем\n"
     "/link <код> <мой_алиас> — связать своего бота с ботом другого владельца\n"
     "/links — межвладельческие связи (id, политики)\n"
@@ -141,6 +144,50 @@ class Hub:
                 return self.say(uid, "Политика: ask или auto")
             self.db.set_route(uid, src, dst, policy=pol)
             return self.say(uid, f"Маршрут {src or 'вы'} → {dst}: {pol}")
+        if low.startswith("/protocol"):
+            return self.say(uid, protocol.AGENT_PROTOCOL)
+        if low.startswith("/log"):
+            parts = text.split()
+            alias = parts[1].strip() if len(parts) > 1 else ""
+            limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 15
+            if alias:
+                rows = self.db.q(
+                    "SELECT * FROM tasks WHERE owner_tg=? AND (src_alias=? OR dst_alias=?) "
+                    "ORDER BY created_at DESC LIMIT ?", (uid, alias, alias, min(limit, 50)))
+            else:
+                rows = self.db.q("SELECT * FROM tasks WHERE owner_tg=? ORDER BY created_at DESC "
+                                 "LIMIT ?", (uid, min(limit, 50)))
+            if not rows:
+                return self.say(uid, "Задач нет.")
+            lines = ["задача  напр  состояние      хоп  время      текст"]
+            for r in rows:
+                when = time.strftime("%H:%M", time.localtime(float(r["created_at"])))
+                arrow = f"{r['src_alias']}→{r['dst_alias']}"
+                text_short = (r["text"] or r["question"] or "").replace("\n", " ")[:44]
+                lines.append(f"{r['task_id']} {arrow:>10} {r['status']:<14} {r['hops']:<4} "
+                             f"{when:<10} {text_short}")
+            self.db.event("owner_log", owner=uid, alias=alias or "*", count=len(rows))
+            return self.say(uid, "```\n" + "\n".join(lines) + "\n```")
+        if low.startswith("/task"):
+            parts = text.split()
+            if len(parts) < 2:
+                return self.say(uid, "Использование: /task <task_id>")
+            task = self.db.task(parts[1].strip())
+            if not task or int(task["owner_tg"]) != uid:
+                return self.say(uid, "Задача не найдена.")
+            view = rpc.task_view(task)
+            events = self.db.q("SELECT kind, ts FROM events WHERE task_id=? ORDER BY id",
+                               (task["task_id"],))
+            body = [f"задача {task['task_id']}  {task['src_alias']}→{task['dst_alias']}  "
+                    f"hops {task['hops']}  ctx {task['ctx']}",
+                    f"состояние: {view['status']['state']} ({task['status']})",
+                    f"текст: {(task['text'] or '')[:300]}"]
+            if task["question"]:
+                body.append(f"вопрос: {task['question'][:300]}")
+            if task["answer"]:
+                body.append(f"ответ: {task['answer'][:300]}")
+            body.append("события: " + ", ".join(f"{e['kind']}" for e in events[-8:]))
+            return self.say(uid, "\n".join(body))
         if low.startswith("/describe"):
             parts = text.split(maxsplit=2)
             if len(parts) < 2:
@@ -286,6 +333,9 @@ class Hub:
         method = str(env.get("method") or "")
         params = env.get("params") or {}
         owner = int(bot["owner_tg"])
+
+        if method in ("agent/protocol", "agent/help"):
+            return self.say(bot_id, rpc.rpc_ok(rpc_id, {"protocol": protocol.AGENT_PROTOCOL}))
 
         if method in ("agent/card", "agent/getCard", "a2a/discover"):
             target = str(params.get("alias") or "").strip()
