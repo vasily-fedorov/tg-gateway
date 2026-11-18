@@ -263,6 +263,68 @@ def run() -> dict:
     assert default_hub.db.owner(OWNER), "владелец из allowlist работает"
     res["closed_by_default"] = True
 
+    # 10g. межвладельческая связь: /share → /link → два подтверждения
+    OWNER_B = 777000111
+    BOT_B = 8727385599
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    hub.handle(msg(OWNER_B, "/start"))
+    hub.handle(msg(OWNER_B, "/pair bee"))
+    code_b = [ln for ln in tg.sent[-1]["text"].splitlines() if ln.startswith("/pair ")][0]
+    hub.handle(msg(BOT_B, code_b, is_bot=True, username="owner_b_bot"))
+    # B выдаёт приглашение на своего бота
+    hub.handle(msg(OWNER_B, "/share bee"))
+    invite = [x for x in tg.sent if x["chat"] == OWNER_B][-1]["text"]
+    link_code = [w for w in invite.split() if w.startswith("LINK-")][0]
+    # A связывает своего god с ботом B
+    hub.handle(msg(OWNER, f"/link {link_code} god"))
+    links = hub.db.links_for_owner(OWNER)
+    assert links and links[0]["dst_username"] == "owner_b_bot", links
+    # A шлёт сообщение на @owner_b_bot: карточка A -> карточка B -> доставка
+    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "@owner_b_bot", "text": "привет B"}),
+                   is_bot=True, username="god"))
+    card_a = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
+    task_id = card_a["buttons"][0][0][1].split(":")[2]
+    assert not envelopes(tg, BOT_B), "до подтверждений доставки быть не должно"
+    hub.handle(cb(OWNER, f"hub:ok:{task_id}"))
+    card_b = [x for x in tg.sent if x["chat"] == OWNER_B and x["buttons"]][-1]
+    assert "чужого владельца" in card_b["text"], card_b
+    assert card_b["buttons"][0][0][1] == f"hub:in:{task_id}"
+    assert not envelopes(tg, BOT_B), "ждём подтверждения получателя"
+    # чужой (A) не может нажать карточку получателя
+    hub.handle(cb(OWNER, f"hub:in:{task_id}", message_id=2))
+    assert not envelopes(tg, BOT_B)
+    hub.handle(cb(OWNER_B, f"hub:in:{task_id}", message_id=2))
+    got = envelopes(tg, BOT_B)
+    assert got and got[-1]["text"] == "привет B", got
+    res["cross_owner_link_flow"] = True
+
+    # 10h. отказ получателя и разрыв связи
+    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "@owner_b_bot", "text": "второе"}),
+                   is_bot=True, username="god"))
+    t2 = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
+    task2 = t2["buttons"][0][0][1].split(":")[2]
+    hub.handle(cb(OWNER, f"hub:ok:{task2}"))
+    hub.handle(cb(OWNER_B, f"hub:inx:{task2}", message_id=3))
+    assert hub.db.task(task2)["status"] == "rejected"
+    assert not [e for e in envelopes(tg, BOT_B) if e.get("text") == "второе"]
+    link_id = hub.db.links_for_owner(OWNER)[0]["id"]
+    hub.handle(msg(OWNER, f"/unlink {link_id}"))
+    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "@owner_b_bot", "text": "третье"}),
+                   is_bot=True, username="god"))
+    assert any("Нет бота" in x["text"] for x in tg.sent), tg.sent[-1]
+    res["cross_owner_reject_and_unlink"] = True
+
+    # 10i. без кода связи нет
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    hub.handle(msg(OWNER, "/link LINK-NOPE god"))
+    assert any("не найден" in x["text"] for x in tg.sent), tg.sent[-1]
+    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "@nobody_bot", "text": "x"}),
+                   is_bot=True, username="god"))
+    assert any("Нет бота" in x["text"] for x in tg.sent), tg.sent[-1]
+    res["no_link_no_delivery"] = True
+
     # 11. policy-функции
     assert policy.needs_approval(policy="ask", ctx="", hops=1, direction="relay") is True
     assert policy.needs_approval(policy="auto", ctx="ab12", hops=2, direction="reply") is False

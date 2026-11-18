@@ -29,6 +29,10 @@ HELP = (
     "/route <от> <кому> ask|auto — политика подтверждений ('-' = вы)\n"
     "/cancel <задача> — отменить задачу\n"
     "/unpair <алиас> — отключить бота (бот освобождается)\n"
+    "/share <алиас> — код приглашения для связи с чужим владельцем\n"
+    "/link <код> <мой_алиас> — связать своего бота с ботом другого владельца\n"
+    "/links — межвладельческие связи (id, политики)\n"
+    "/unlink <id> — разорвать связь\n"
     "/help — это сообщение\n\n"
     "Всё, что бот присылает вам на подтверждение, приходит карточкой сюда.\n"
     "Ответ на вопрос бота — просто текстом в ответ на карточку."
@@ -133,6 +137,60 @@ class Hub:
                 return self.say(uid, "Политика: ask или auto")
             self.db.set_route(uid, src, dst, policy=pol)
             return self.say(uid, f"Маршрут {src or 'вы'} → {dst}: {pol}")
+        if low.startswith("/share"):
+            parts = text.split()
+            if len(parts) < 2:
+                return self.say(uid, "Использование: /share <алиас>")
+            bot = self.db.bot_by_alias(uid, parts[1].strip())
+            if not bot:
+                return self.say(uid, "Такого бота нет.")
+            code = "LINK-" + secrets.token_hex(2).upper()
+            self.db.create_invite(int(bot["bot_id"]), uid, code)
+            self.db.event("invite_created", owner=uid, alias=parts[1])
+            return self.say(uid, f"Код для связи с ботом «{parts[1]}»:\n\n{code}\n\n"
+                                 "Передайте его второму владельцу: он введёт "
+                                 f"/link {code} <свой_алиас>\n"
+                                 "Код одноразовый. Входящие от чужого владельца "
+                                 "по умолчанию требуют вашего подтверждения.")
+        if low.startswith("/link"):
+            parts = text.split()
+            if len(parts) < 3:
+                return self.say(uid, "Использование: /link <код> <мой_алиас>")
+            mine = self.db.bot_by_alias(uid, parts[2].strip())
+            if not mine:
+                return self.say(uid, "Сначала /pair <алиас> — такого бота у вас нет.")
+            row = self.db.redeem_invite(parts[1])
+            if not row:
+                return self.say(uid, "Код не найден или уже использован.")
+            if int(row["owner_tg"]) == uid:
+                return self.say(uid, "Это ваш собственный код.")
+            self.db.add_link(int(mine["bot_id"]), int(row["bot_id"]))
+            self.db.event("link_created", owner=uid, src=int(mine["bot_id"]),
+                          dst=int(row["bot_id"]))
+            other = self.db.bot_by_id(int(row["bot_id"]))
+            self.say(uid, f"Связь создана: «{mine['alias']}» ↔ @{other['username']}.\n"
+                          "Исходящие — по вашей политике, входящие от него — по его.")
+            self.say(int(row["owner_tg"]),
+                     f"🔗 @{mine['username']} связался с вашим ботом @{other['username']}. "
+                     "Его исходящие будут приходить вам на подтверждение.")
+            return
+        if low.startswith("/links"):
+            rows = self.db.links_for_owner(uid)
+            if not rows:
+                return self.say(uid, "Связей нет. /share <алиас> → код для второго владельца.")
+            lines = [f"• #{r['id']} @{r['src_username']} → @{r['dst_username']} "
+                     f"(out {r['policy_src']}, in {r['policy_dst']})" for r in rows]
+            return self.say(uid, "Связи:\n" + "\n".join(lines))
+        if low.startswith("/unlink"):
+            parts = text.split()
+            if len(parts) < 2 or not parts[1].strip().isdigit():
+                return self.say(uid, "Использование: /unlink <id из /links>")
+            link = self.db.link_by_id(int(parts[1]))
+            if not link:
+                return self.say(uid, "Связи с таким id нет.")
+            self.db.drop_link(int(parts[1]))
+            self.db.event("link_dropped", owner=uid, link=int(parts[1]))
+            return self.say(uid, "Связь разорвана.")
         if low.startswith("/unpair"):
             parts = text.split()
             if len(parts) < 2:
@@ -220,6 +278,11 @@ class Hub:
         ctx = str(env.get("ctx") or "") or None
         hops = int(env.get("hops") or 1)
         target = self.db.bot_by_alias(owner, dst_alias)
+        link = None
+        if not target:
+            link = self.db.link_for(int(bot["bot_id"]), dst_alias)
+            if link:
+                target = self.db.bot_by_id(int(link["dst_id"]))
         if not target:
             return self.say(int(bot["bot_id"]), f"Нет бота «{dst_alias}» у владельца.")
         if not policy.hop_allowed(hops):
@@ -228,7 +291,7 @@ class Hub:
         route = self.db.route(owner, bot["alias"], dst_alias)
         max_text = int(route["max_text"]) if route else policy.MAX_TEXT
         per_hour = int(route["per_hour"]) if route else policy.PER_HOUR
-        rpolicy = str(route["policy"]) if route else "ask"
+        rpolicy = str(link["policy_src"]) if link else (str(route["policy"]) if route else "ask")
         err = policy.check_limits(text, max_text=max_text, per_hour=per_hour,
                                   used_hour=self.db.hours_used(owner, bot["alias"], dst_alias))
         if err:
@@ -238,18 +301,37 @@ class Hub:
         ctx = ctx or new_id(4)
         approve = policy.needs_approval(policy=rpolicy, ctx=ctx if hops > 1 else "",
                                         hops=hops, direction="relay")
+        stored_dst = f"@{target['username']}" if link else dst_alias
         self.db.create_task(task_id=task_id, owner=owner, direction="relay", ctx=ctx,
-                            hops=hops, src=bot["alias"], dst=dst_alias, text=text,
+                            hops=hops, src=bot["alias"], dst=stored_dst, text=text,
                             status="submitted" if approve else "working")
         self.db.event("relay_parked" if approve else "relay_auto", task_id=task_id, owner=owner,
                       src=bot["alias"], dst=dst_alias, hops=hops, ctx=ctx, length=len(text))
         if approve:
-            ok, res = self.tg.send(owner, self.card_text(bot["alias"], dst_alias, text, task_id,
+            ok, res = self.tg.send(owner, self.card_text(bot["alias"], stored_dst, text, task_id,
                                                          ctx, hops),
                                    [[("Отправить", f"hub:ok:{task_id}"),
                                      ("Отклонить", f"hub:no:{task_id}")]])
             if ok and isinstance(res, dict):
                 self.db.update_task(task_id, card_chat=owner, card_msg=res.get("message_id"))
+            return
+        self.after_src_approval(task_id, link)
+
+    def after_src_approval(self, task_id: str, link: Optional[Dict[str, Any]] = None) -> None:
+        """Исходящая сторона согласовала. Для чужого владельца — спросить и его."""
+        task = self.db.task(task_id)
+        if not task:
+            return
+        if link and str(link["policy_dst"]) == "ask":
+            dst_owner = int(link["dst_owner"])
+            preview = str(task["text"] or "").replace("\n", " ")[:300]
+            ok, res = self.tg.send(
+                dst_owner,
+                f"Входящее от чужого владельца: {task['src_alias']} → @{link['dst_username']}"
+                f"\n\n{preview}\n\n· задача {task_id} · ctx {task['ctx']}",
+                [[("Принять", f"hub:in:{task_id}"), ("Отклонить", f"hub:inx:{task_id}")]])
+            if ok:
+                self.db.event("cross_inbound_parked", task_id=task_id, owner=dst_owner)
             return
         self.deliver(task_id)
 
@@ -263,6 +345,8 @@ class Hub:
         if not task:
             return False
         target = self.db.bot_by_alias(int(task["owner_tg"]), task["dst_alias"])
+        if not target and str(task["dst_alias"] or "").startswith("@"):
+            target = self.db.bot_by_username(task["dst_alias"])
         if not target:
             self.db.update_task(task_id, status="failed")
             self.db.event("deliver_failed", task_id=task_id, reason="no_target")
@@ -340,11 +424,34 @@ class Hub:
         if not task:
             self.tg.answer_callback(cb_id, "Задача не найдена")
             return self.finish_card(chat_id, msg_id, "⌛ Задача неактивна.")
+
+        # Входящая карточка чужого владельца: права проверяем по владельцу получателя
+        if verdict in ("in", "inx"):
+            dst_bot = self.db.bot_by_username(str(task["dst_alias"]))
+            if not dst_bot or int(dst_bot["owner_tg"]) != uid:
+                self.db.event("card_unauthorized", task_id=task_id, owner=uid)
+                self.tg.answer_callback(cb_id, "Нет прав")
+                return self.finish_card(chat_id, msg_id, "⛔ Нет прав.")
+            if task["status"] in TERMINAL:
+                self.tg.answer_callback(cb_id, "Уже закрыта")
+                return self.finish_card(chat_id, msg_id, f"⌛ Задача уже {task['status']}.")
+            if verdict == "inx":
+                self.tg.answer_callback(cb_id, "Отклонено")
+                self.db.update_task(task_id, status="rejected")
+                self.db.event("cross_inbound_rejected", task_id=task_id, owner=uid)
+                self.say(int(task["owner_tg"]),
+                         f"Получатель отклонил входящее по задаче {task_id}.")
+                return self.finish_card(chat_id, msg_id, "❌ Отклонено.")
+            self.tg.answer_callback(cb_id, "Принято")
+            ok = self.deliver(task_id)
+            self.db.event("cross_inbound_approved", task_id=task_id, owner=uid, ok=bool(ok))
+            return self.finish_card(chat_id, msg_id,
+                                    "✅ Доставлено" if ok else "❌ Не доставлено")
+
         if int(task["owner_tg"]) != uid:  # чужую карточку подтверждать нельзя
             self.db.event("card_unauthorized", task_id=task_id, owner=uid)
             self.tg.answer_callback(cb_id, "Нет прав")
             return self.finish_card(chat_id, msg_id, "⛔ Нет прав.")
-            return self.finish_card(chat_id, msg_id, "⌛ Задача неактивна.")
         if task["status"] in TERMINAL:
             self.tg.answer_callback(cb_id, "Уже закрыта")
             return self.finish_card(chat_id, msg_id, f"⌛ Задача уже {task['status']}.")
@@ -355,8 +462,17 @@ class Hub:
             return self.finish_card(chat_id, msg_id, "❌ Отклонено.")
         self.db.update_task(task_id, status="working")
         self.db.event("card_approved", task_id=task_id, owner=uid)
+        src_bot = self.db.bot_by_alias(int(task["owner_tg"]), str(task["src_alias"]))
+        link = None
+        if src_bot and str(task["dst_alias"] or "").startswith("@"):
+            link = self.db.link_for(int(src_bot["bot_id"]), str(task["dst_alias"]))
+        if link:
+            self.after_src_approval(task_id, link)
+            sent = self.db.task(task_id)["status"] != "rejected"
+            return self.finish_card(chat_id, msg_id,
+                                    "✅ Отправлено, ждём подтверждения получателя"
+                                    if sent else "❌ Отклонено")
         ok = self.deliver(task_id)
-        target = self.db.bot_by_alias(uid, task["dst_alias"])
         self.finish_card(chat_id, msg_id,
                          f"✅ Отправлено → {task['dst_alias']}" if ok else "❌ Не доставлено")
 

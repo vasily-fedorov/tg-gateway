@@ -64,6 +64,22 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, owner_tg);
+CREATE TABLE IF NOT EXISTS invites (
+    code        TEXT PRIMARY KEY,
+    bot_id      INTEGER NOT NULL,
+    owner_tg    INTEGER NOT NULL,
+    created_at  REAL NOT NULL,
+    used_at     REAL
+);
+CREATE TABLE IF NOT EXISTS links (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    src_bot_id  INTEGER NOT NULL,
+    dst_bot_id  INTEGER NOT NULL,
+    policy_src  TEXT NOT NULL DEFAULT 'ask',
+    policy_dst  TEXT NOT NULL DEFAULT 'ask',
+    created_at  REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS links_pair ON links(src_bot_id, dst_bot_id);
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -152,6 +168,50 @@ class Db:
 
     def bots(self, owner: int) -> List[sqlite3.Row]:
         return self.q("SELECT * FROM bots WHERE owner_tg=? ORDER BY alias", (owner,))
+
+    # ── межвладельческие связи ───────────────────────────────────────────────
+    def create_invite(self, bot_id: int, owner: int, code: str) -> None:
+        self.conn.execute("INSERT INTO invites (code, bot_id, owner_tg, created_at) "
+                          "VALUES (?,?,?,?)", (code.upper(), bot_id, owner, now()))
+
+    def redeem_invite(self, code: str) -> Optional[sqlite3.Row]:
+        row = self.one("SELECT * FROM invites WHERE code=? AND used_at IS NULL", (code.upper(),))
+        if row:
+            self.conn.execute("UPDATE invites SET used_at=? WHERE code=?", (now(), code.upper()))
+        return row
+
+    def add_link(self, src_bot_id: int, dst_bot_id: int, *, policy_src: str = "ask",
+                 policy_dst: str = "ask") -> None:
+        self.conn.execute(
+            "INSERT INTO links (src_bot_id, dst_bot_id, policy_src, policy_dst, created_at) "
+            "VALUES (?,?,?,?,?) ON CONFLICT(src_bot_id, dst_bot_id) DO UPDATE SET "
+            "policy_src=excluded.policy_src, policy_dst=excluded.policy_dst",
+            (src_bot_id, dst_bot_id, policy_src, policy_dst, now()))
+
+    def link_for(self, src_bot_id: int, dst_username: str) -> Optional[sqlite3.Row]:
+        return self.one(
+            "SELECT l.*, b.bot_id AS dst_id, b.username AS dst_username, b.owner_tg AS dst_owner "
+            "FROM links l JOIN bots b ON b.bot_id=l.dst_bot_id "
+            "WHERE l.src_bot_id=? AND b.username=? AND b.enabled=1",
+            (src_bot_id, dst_username.lstrip("@")))
+
+    def link_by_id(self, link_id: int) -> Optional[sqlite3.Row]:
+        return self.one(
+            "SELECT l.*, b.bot_id AS dst_id, b.username AS dst_username, b.owner_tg AS dst_owner "
+            "FROM links l JOIN bots b ON b.bot_id=l.dst_bot_id WHERE l.id=?", (link_id,))
+
+    def links_for_owner(self, owner: int) -> List[sqlite3.Row]:
+        return self.q(
+            "SELECT l.*, s.username AS src_username, d.username AS dst_username "
+            "FROM links l JOIN bots s ON s.bot_id=l.src_bot_id JOIN bots d ON d.bot_id=l.dst_bot_id "
+            "WHERE s.owner_tg=? OR d.owner_tg=? ORDER BY l.id", (owner, owner))
+
+    def drop_link(self, link_id: int) -> None:
+        self.conn.execute("DELETE FROM links WHERE id=?", (link_id,))
+
+    def bot_by_username(self, username: str) -> Optional[sqlite3.Row]:
+        return self.one("SELECT * FROM bots WHERE username=? AND enabled=1",
+                        (username.lstrip("@"),))
 
     # ── routes ───────────────────────────────────────────────────────────────
     def route(self, owner: int, src: str, dst: str) -> Optional[sqlite3.Row]:
