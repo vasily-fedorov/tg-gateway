@@ -49,8 +49,9 @@ def envelope(**payload: Any) -> str:
 
 class Hub:
     def __init__(self, token: str, db_path: pathlib.Path | str, owner_ids: Iterable[int] = (),
-                 *, tg: Optional[Tg] = None, clock=time.time, open_registration: bool = False):
-        self.tg = tg or Tg(token)
+                 *, tg: Optional[Tg] = None, clock=time.time, open_registration: bool = False,
+                 proxy: str | None = None):
+        self.tg = tg or Tg(token, proxy=proxy)
         self.db = Db(db_path)
         self.owners = {int(x) for x in owner_ids}
         self.open_registration = bool(open_registration)
@@ -506,9 +507,12 @@ def main() -> int:
     db_path = os.environ.get("TG_GATEWAY_DB", str(pathlib.Path.home() / "tg-gateway/hub.sqlite3"))
     # По умолчанию шлюз ЗАКРЫТ: работают только TG_GATEWAY_OWNERS.
     open_reg = os.environ.get("TG_GATEWAY_OPEN", "0").strip().lower() in ("1", "true", "yes")
+    proxy = (os.environ.get("TG_GATEWAY_PROXY") or os.environ.get("HTTPS_PROXY")
+             or os.environ.get("https_proxy") or "").strip() or None
     hub = Hub(token, db_path, [int(x) for x in owners.split(",") if x.strip()],
-              open_registration=open_reg)
-    print(f"hub: db={db_path} owners={sorted(hub.owners)}", flush=True)
+              open_registration=open_reg, proxy=proxy)
+    print(f"hub: db={db_path} owners={sorted(hub.owners)} proxy={'yes' if proxy else 'no'}",
+          flush=True)
     hub.run()
     return 0
 

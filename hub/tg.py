@@ -13,10 +13,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 class Tg:
-    def __init__(self, token: str, *, timeout: int = 35, base: str = "https://api.telegram.org"):
+    def __init__(self, token: str, *, timeout: int = 35, base: str = "https://api.telegram.org",
+                 proxy: str | None = None):
         self.token = token
         self.timeout = timeout
         self.base = base.rstrip("/")
+        # Часть инсталляций ходит в Telegram через HTTP-прокси (как агенты Hermes).
+        if proxy:
+            handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            self._opener = urllib.request.build_opener(handler)
+        else:
+            self._opener = urllib.request.build_opener()
 
     # ── low level ────────────────────────────────────────────────────────────
     def call(self, method: str, **params: Any) -> Tuple[bool, Any]:
@@ -24,7 +31,7 @@ class Tg:
         data = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None}).encode()
         req = urllib.request.Request(url, data=data)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with self._opener.open(req, timeout=self.timeout) as resp:
                 payload = json.load(resp)
         except urllib.error.HTTPError as exc:  # тело ошибки тоже JSON
             try:
