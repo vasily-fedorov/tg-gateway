@@ -307,13 +307,8 @@ class Hub:
                 kind = str(part.get("kind") or "text")
                 if kind == "text":
                     text_parts.append(str(part.get("text") or ""))
-                elif kind == "data":
-                    text_parts.append(json.dumps(part.get("data") or {}, ensure_ascii=False))
-                    attachments.append(part)
-                elif kind == "file":
-                    file_info = part.get("file") or {}
-                    name = str(file_info.get("name") or file_info.get("uri") or "file")
-                    text_parts.append(f"[файл: {name}]")
+                elif kind in ("data", "file"):
+                    # в теле — только текст; data/file едут отдельными parts
                     attachments.append(part)
             text = "\n".join(x.strip() for x in text_parts if x.strip()).strip()
             message_id = str(msg.get("messageId") or "")
@@ -331,7 +326,9 @@ class Hub:
             if not to_alias:
                 return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_INVALID_PARAMS,
                                                     "нужен params.message.to (алиас)"))
-            fp = policy.fingerprint(src=str(bot["alias"]), dst=to_alias, text=text)
+            fp = policy.fingerprint(src=str(bot["alias"]), dst=to_alias,
+                                    text=text + json.dumps(attachments, ensure_ascii=False,
+                                                           sort_keys=True))
             if message_id:
                 seen = self.db.seen_message(message_id)
                 if seen:
