@@ -89,6 +89,11 @@ python3 -c "import ast; ast.parse(open('core.py').read())"
 <launch-home>/plugins/gateway-relay/     # хук + callback-фабрика
 ```
 
+**Имя плагина в `plugin.yaml` — per-agent.** В `plugins.enabled` агента указано имя из
+манифеста: у sysadmin это `gateway-relay`, у example-agent — `group-gateway`. Копируя
+манифест между агентами, меняйте `name:` — иначе плагин молча не включается (хук не
+работает, ботовые DM уходят в модель), и в аудите нет ни событий, ни ошибок.
+
 После копирования — перезапуск гейтвея (Docker — `docker restart <container>`, хостовый —
 graceful `SIGUSR1` из `gateway_state.json`). Проверка: в логе
 `Wired native handlers from plugin` и карточка в ЛС владельца.
