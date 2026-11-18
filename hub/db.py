@@ -108,6 +108,15 @@ class Db:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self.q("PRAGMA table_info(bots)")}
+        if "description" not in cols:
+            self.conn.execute("ALTER TABLE bots ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS inbox_msgs (message_id TEXT PRIMARY KEY, task_id TEXT, "
+            "created_at REAL NOT NULL)")
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def q(self, sql: str, args: tuple = ()) -> List[sqlite3.Row]:
@@ -168,6 +177,22 @@ class Db:
 
     def bots(self, owner: int) -> List[sqlite3.Row]:
         return self.q("SELECT * FROM bots WHERE owner_tg=? ORDER BY alias", (owner,))
+
+    def seen_message(self, message_id: str) -> Optional[str]:
+        row = self.one("SELECT task_id FROM inbox_msgs WHERE message_id=?", (message_id,))
+        return row["task_id"] if row else None
+
+    def remember_message(self, message_id: str, task_id: str) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO inbox_msgs (message_id, task_id, created_at) "
+                          "VALUES (?,?,?)", (message_id, task_id, now()))
+
+    def set_description(self, owner: int, alias: str, text: str) -> bool:
+        bot = self.bot_by_alias(owner, alias)
+        if not bot:
+            return False
+        self.conn.execute("UPDATE bots SET description=? WHERE bot_id=?",
+                          (text[:300], int(bot["bot_id"])))
+        return True
 
     # ── межвладельческие связи ───────────────────────────────────────────────
     def create_invite(self, bot_id: int, owner: int, code: str) -> None:

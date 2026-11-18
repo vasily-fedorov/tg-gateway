@@ -325,6 +325,63 @@ def run() -> dict:
     assert any("Нет бота" in x["text"] for x in tg.sent), tg.sent[-1]
     res["no_link_no_delivery"] = True
 
+    # 10j. JSON-RPC (A2A-форма) поверх Telegram
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.handle(msg(OWNER, "/describe aa что умеет: смотреть диск и логи"))
+
+    def rpc_call(mid, method, params, bot_id=GOD, username="god"):
+        hub.handle(msg(bot_id, json.dumps({"jsonrpc": "2.0", "id": mid,
+                                           "method": method, "params": params}),
+                       is_bot=True, username=username))
+        return json.loads(tg.sent[-1]["text"])
+
+    res_send = rpc_call("r1", "message/send", {
+        "message": {"role": "user", "messageId": "m-1", "parts": [{"kind": "text",
+                                                                   "text": "привет, aa"}]},
+        "message_to_fix": None, "to": "aa"})
+    assert res_send["jsonrpc"] == "2.0" and res_send["id"] == "r1", res_send
+    task_view = res_send["result"]["task"]
+    assert task_view["id"] and task_view["status"]["state"] == "auth-required", task_view
+    assert task_view["kind"] == "task" and task_view["artifacts"][0]["parts"][0]["text"]
+    assert any(x["chat"] == OWNER and x["buttons"] for x in tg.sent), "карточка владельцу"
+    res["rpc_message_send_auth_required"] = True
+
+    # дедуп по messageId
+    again = rpc_call("r2", "message/send", {
+        "message": {"role": "user", "messageId": "m-1", "parts": [{"kind": "text",
+                                                                   "text": "привет, aa"}]},
+        "to": "aa"})
+    assert again["result"]["deduplicated"] is True
+    assert again["result"]["task"]["id"] == task_view["id"], again
+    res["rpc_idempotent_message_id"] = True
+
+    # agent/card отдаёт навыки
+    card = rpc_call("r3", "agent/card", {})["result"]
+    names = [s["id"] for s in card["card"]["skills"]]
+    assert names == ["aa", "god"], names
+    assert "смотреть диск" in [s for s in card["card"]["skills"] if s["id"] == "aa"][0]["description"]
+    one = rpc_call("r4", "agent/card", {"alias": "aa"})["result"]["card"]
+    assert one["name"] == "@aa" and one["capabilities"]["humanApproval"] is True, one
+    res["rpc_agent_card"] = True
+
+    # tasks/get и tasks/cancel
+    got = rpc_call("r5", "tasks/get", {"id": task_view["id"]})
+    assert got["result"]["task"]["status"]["state"] == "auth-required", got
+    cancelled = rpc_call("r6", "tasks/cancel", {"id": task_view["id"]})
+    assert cancelled["result"]["task"]["status"]["state"] == "canceled", cancelled
+    assert hub.db.task(task_view["id"])["status"] == "cancelled"
+    bad = rpc_call("r7", "tasks/nope", {})
+    assert bad["error"]["code"] == -32601, bad
+    res["rpc_tasks_get_cancel"] = True
+
+    # legacy-конверт продолжает работать
+    hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),
+                   is_bot=True, username="god"))
+    assert any("Переслать" in x["text"] for x in tg.sent), "legacy relay сломался"
+    res["legacy_envelope_still_works"] = True
+
     # 11. policy-функции
     assert policy.needs_approval(policy="ask", ctx="", hops=1, direction="relay") is True
     assert policy.needs_approval(policy="auto", ctx="ab12", hops=2, direction="reply") is False

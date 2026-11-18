@@ -280,6 +280,10 @@ def run() -> dict:
     # чужой бот в endpoint-режиме не принимается
     r = asyncio.run(call(make_event("@gateway_alpha привет", is_bot=True, user_id=PEER_BOT_ID)))
     assert r == {"action": "skip", "reason": "relay:bot-not-allowed"}, r
+    # JSON-RPC ответ хаба не должен уходить в модель
+    rpc_resp = json.dumps({"jsonrpc": "2.0", "id": "r-1", "result": {"task": {"id": "x"}}})
+    r = asyncio.run(call(make_event(rpc_resp, is_bot=True, user_id=HUB_ID, thread_id=None)))
+    assert r == {"action": "skip", "reason": "relay:hub-rpc"}, r
     res["endpoint_inbound"] = True
 
     # 18. endpoint: ответ drain уходит хабу JSON-конвертом
@@ -291,6 +295,13 @@ def run() -> dict:
     payload = json.loads(hub_msgs[-1][1])
     assert payload == {"t": "reply", "task": "hub42", "verdict": "done",
                        "text": "свободно 31 ГБ"}, payload
+    sent.clear()
+    out_env = json.loads(mod.tool_send({"target": "aa", "text": "через rpc"}))
+    assert out_env["status"] == "submitted_to_hub", out_env
+    wire = [json.loads(m[1]) for m in sent if m[0] == int(HUB_ID) and m[1].startswith("{")]
+    assert wire and wire[-1]["method"] == "message/send", wire
+    assert wire[-1]["params"]["to"] == "aa"
+    assert wire[-1]["params"]["message"]["parts"][0]["text"] == "через rpc"
     res["endpoint_reply_to_hub"] = True
     mod._routes = base_routes
 

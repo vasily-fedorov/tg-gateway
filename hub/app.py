@@ -17,7 +17,7 @@ import sys
 import time
 from typing import Any, Dict, Iterable, Optional
 
-from . import policy
+from . import policy, rpc
 from .db import CARD_TTL_S, TERMINAL, Db
 from .tg import Tg
 
@@ -29,6 +29,8 @@ HELP = (
     "/route <от> <кому> ask|auto — политика подтверждений ('-' = вы)\n"
     "/cancel <задача> — отменить задачу\n"
     "/unpair <алиас> — отключить бота (бот освобождается)\n"
+    "/describe <алиас> <текст> — что бот умеет (пойдёт в agent card)\n"
+    "/card [алиас] — A2A-карточка хаба или бота\n"
     "/share <алиас> — код приглашения для связи с чужим владельцем\n"
     "/link <код> <мой_алиас> — связать своего бота с ботом другого владельца\n"
     "/links — межвладельческие связи (id, политики)\n"
@@ -56,6 +58,7 @@ class Hub:
         self.owners = {int(x) for x in owner_ids}
         self.open_registration = bool(open_registration)
         self.clock = clock
+        self._last_refusal = ""
 
     # ── основной цикл ────────────────────────────────────────────────────────
     def run(self, *, max_updates: Optional[int] = None) -> None:
@@ -138,6 +141,26 @@ class Hub:
                 return self.say(uid, "Политика: ask или auto")
             self.db.set_route(uid, src, dst, policy=pol)
             return self.say(uid, f"Маршрут {src or 'вы'} → {dst}: {pol}")
+        if low.startswith("/describe"):
+            parts = text.split(maxsplit=2)
+            if len(parts) < 2:
+                return self.say(uid, "Использование: /describe <алиас> <что умеет>")
+            desc = parts[2] if len(parts) > 2 else ""
+            if not self.db.set_description(uid, parts[1].strip(), desc):
+                return self.say(uid, "Такого бота нет.")
+            self.db.event("bot_described", owner=uid, alias=parts[1])
+            return self.say(uid, f"Навык «{parts[1]}» обновлён — попадёт в agent card.")
+        if low.startswith("/card"):
+            parts = text.split()
+            if len(parts) > 1:
+                peer = self.db.bot_by_alias(uid, parts[1].strip())
+                if not peer:
+                    return self.say(uid, "Такого бота нет.")
+                return self.say(uid, rpc.bot_card(peer, uid)["description"] +
+                                "\n\n" + envelope(**rpc.bot_card(peer, uid)))
+            card = rpc.hub_card(uid, self.db.bots(uid))
+            return self.say(uid, object.__str__(card["description"]) + "\n\n" +
+                            envelope(**card))
         if low.startswith("/share"):
             parts = text.split()
             if len(parts) < 2:
@@ -241,16 +264,102 @@ class Hub:
                 return self.pair_bot(bot_id, username, text)
             return self.say(chat_id or bot_id, "Бот не подключён. Владелец: /pair <алиас>")
         if not text.startswith("{"):
-            return self.say(bot_id, "Формат: JSON-конверт (см. README хаба)")
+            return self.say(bot_id, "Формат: JSON-RPC 2.0 или конверт (см. README хаба)")
         try:
             env = json.loads(text)
         except ValueError:
             return self.say(bot_id, "Битый JSON.")
+        if "jsonrpc" in env or "method" in env:
+            return self.on_rpc(bot, env)
         if env.get("t") == "relay":
             return self.on_relay(bot, env)
         if env.get("t") == "reply":
             return self.on_reply(bot, env)
         self.say(bot_id, "Неизвестный тип конверта.")
+
+    # ── JSON-RPC (A2A-форма поверх Telegram) ─────────────────────────────────
+    def on_rpc(self, bot: Any, env: Dict[str, Any]) -> None:
+        bot_id = int(bot["bot_id"])
+        rpc_id = env.get("id")
+        method = str(env.get("method") or "")
+        params = env.get("params") or {}
+        owner = int(bot["owner_tg"])
+
+        if method in ("agent/card", "agent/getCard", "a2a/discover"):
+            target = str(params.get("alias") or "").strip()
+            if target:
+                peer = self.db.bot_by_alias(owner, target)
+                if not peer:
+                    return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_FOUND,
+                                                        f"нет бота «{target}»"))
+                return self.say(bot_id, rpc.rpc_ok(rpc_id, {"card": rpc.bot_card(peer, owner)}))
+            return self.say(bot_id, rpc.rpc_ok(rpc_id, {
+                "card": rpc.hub_card(owner, self.db.bots(owner)),
+                "cards": [rpc.bot_card(b, owner) for b in self.db.bots(owner)]}))
+
+        if method in ("message/send", "message/stream"):
+            msg = params.get("message") or {}
+            parts = msg.get("parts") or []
+            text = "".join(str(p.get("text") or "") for p in parts
+                           if str(p.get("kind") or "text") == "text").strip()
+            message_id = str(msg.get("messageId") or "")
+            ctx = str(msg.get("contextId") or "")
+            hops = int((params.get("metadata") or {}).get("hops") or 1)
+            to_alias = str(msg.get("to") or params.get("to") or "").strip()
+            if not to_alias:
+                return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_INVALID_PARAMS,
+                                                    "нужен params.message.to (алиас)"))
+            if message_id:
+                seen = self.db.seen_message(message_id)
+                if seen:
+                    task = self.db.task(seen)
+                    self.db.event("rpc_dedup", task_id=seen, owner=owner)
+                    if task:
+                        return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task),
+                                                                   "deduplicated": True}))
+            before = {r["task_id"] for r in self.db.q(
+                "SELECT task_id FROM tasks WHERE owner_tg=? ORDER BY created_at DESC LIMIT 5",
+                (owner,))}
+            self.on_relay(bot, {"to": to_alias, "text": text, "ctx": ctx, "hops": hops})
+            fresh = [r for r in self.db.q(
+                "SELECT * FROM tasks WHERE owner_tg=? ORDER BY created_at DESC LIMIT 3", (owner,))
+                if r["task_id"] not in before]
+            if not fresh:
+                return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_INVALID_REQUEST,
+                                                    self._last_refusal or "запрос отклонён"))
+            task = fresh[0]
+            if message_id:
+                self.db.remember_message(message_id, task["task_id"])
+            return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task)}))
+
+        if method == "tasks/get":
+            task = self.db.task(str(params.get("id") or ""))
+            if not task or int(task["owner_tg"]) != owner:
+                return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_FOUND,
+                                                    "задача не найдена"))
+            return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task)}))
+
+        if method == "tasks/cancel":
+            task = self.db.task(str(params.get("id") or ""))
+            if not task or int(task["owner_tg"]) != owner:
+                return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_FOUND,
+                                                    "задача не найдена"))
+            if task["status"] in TERMINAL:
+                return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_CANCELABLE,
+                                                    f"задача уже {task['status']}"))
+            self.db.update_task(task["task_id"], status="cancelled")
+            self.db.event("task_cancelled", task_id=task["task_id"], owner=owner, via="rpc")
+            if task["dst_alias"]:
+                self.send_to_agent(task["dst_alias"], owner,
+                                   envelope(t="cancel", task=task["task_id"],
+                                            ctx=task["ctx"], hops=task["hops"]))
+            return self.say(bot_id, rpc.rpc_ok(rpc_id,
+                                               {"task": rpc.task_view(self.db.task(task["task_id"]))}))
+
+        if method == "ping":
+            return self.say(bot_id, rpc.rpc_ok(rpc_id, {"pong": True, "ts": rpc._iso(None)}))
+
+        return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_METHOD_NOT_FOUND, method))
 
     def pair_bot(self, bot_id: int, username: str, text: str) -> None:
         parts = text.split()
@@ -296,6 +405,7 @@ class Hub:
         err = policy.check_limits(text, max_text=max_text, per_hour=per_hour,
                                   used_hour=self.db.hours_used(owner, bot["alias"], dst_alias))
         if err:
+            self._last_refusal = err
             self.db.event("refused", owner=owner, reason=err, src=bot["alias"], dst=dst_alias)
             return self.say(int(bot["bot_id"]), f"Отказ: {err}")
         task_id = new_id()

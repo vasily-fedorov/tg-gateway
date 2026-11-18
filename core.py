@@ -317,12 +317,39 @@ def tool_send(args: Dict[str, Any], **kwargs: Any) -> str:
     target = str(args.get("target") or "").strip().lower()
     text = str(args.get("text") or "").strip()
     data = _routes()
+
+    hub = _hub_cfg()
+    if hub:
+        # A2A-форма: JSON-RPC 2.0 message/send, транспорт — Telegram (ЛС с хабом).
+        # Маршруты и лимиты проверяет хаб: у него реестр всех ботов и владельцев.
+        if not text:
+            return json.dumps({"error": "пустой текст"}, ensure_ascii=False)
+        if len(text) > MAX_TEXT:
+            return json.dumps({"error": f"слишком длинный текст ({len(text)} симв.)"},
+                              ensure_ascii=False)
+        reason = scan_text(text)
+        if reason:
+            _audit("refused", target=target, reason=reason, digest=_digest(text), length=len(text))
+            return json.dumps({"error": "передача отклонена", "reason": reason}, ensure_ascii=False)
+        rpc_id = "r-" + secrets.token_hex(4)
+        payload = {
+            "jsonrpc": "2.0", "id": rpc_id, "method": "message/send",
+            "params": {
+                "message": {"role": "user", "messageId": "m-" + secrets.token_hex(6),
+                            "parts": [{"kind": "text", "text": text}]},
+                "to": target,
+                "metadata": {"hops": 1, "transport": "telegram"},
+            },
+        }
+        ok = _to_hub(json.dumps(payload, ensure_ascii=False))
+        _audit("rpc_message_send", target=target, rpc=rpc_id, ok=ok,
+               digest=_digest(text), length=len(text))
+        if not ok:
+            return json.dumps({"error": "хаб недоступен"}, ensure_ascii=False)
+        return json.dumps({"status": "submitted_to_hub", "rpc_id": rpc_id,
+                           "target": target}, ensure_ascii=False)
+
     route = (data.get("bots") or {}).get(target)
-    if not isinstance(route, dict) or route.get("enabled") is False:
-        return json.dumps({"error": f"маршрут '{target}' не зарегистрирован",
-                           "known": sorted((data.get("bots") or {}).keys())}, ensure_ascii=False)
-    if not text:
-        return json.dumps({"error": "пустой текст"}, ensure_ascii=False)
     if len(text) > int((data.get("limits") or {}).get("max_text", MAX_TEXT)):
         return json.dumps({"error": f"слишком длинный текст ({len(text)} симв.)"}, ensure_ascii=False)
     reason = scan_text(text)
@@ -330,16 +357,6 @@ def tool_send(args: Dict[str, Any], **kwargs: Any) -> str:
         _audit("refused", target=target, reason=reason, digest=_digest(text), length=len(text))
         return json.dumps({"error": "передача отклонена", "reason": reason}, ensure_ascii=False)
 
-    hub = _hub_cfg()
-    if hub:
-        hops = 1
-        ctx = ""
-        env = {"t": "relay", "to": target, "ctx": ctx, "hops": hops, "text": text}
-        ok = _to_hub(json.dumps(env, ensure_ascii=False))
-        _audit("relay_to_hub", target=target, ok=ok, digest=_digest(text), length=len(text))
-        if not ok:
-            return json.dumps({"error": "хаб недоступен"}, ensure_ascii=False)
-        return json.dumps({"status": "sent_to_hub", "target": target}, ensure_ascii=False)
 
     store = _store()
     with store.mutate() as state:
@@ -820,6 +837,17 @@ async def pre_gateway_dispatch(event, gateway=None, session_store=None, **kwargs
             except ValueError:
                 _audit("hub_bad_json", length=len(text))
                 return {"action": "skip", "reason": "relay:hub-bad-json"}
+            if "jsonrpc" in env:
+                store = _store()
+                with store.mutate() as state:
+                    rpc_id = str(env.get("id") or "")
+                    bucket = state.setdefault("rpc", {})
+                    bucket[rpc_id] = env
+                    for stale in list(bucket)[:-20]:
+                        bucket.pop(stale, None)
+                _audit("hub_rpc_result", rpc=env.get("id"),
+                       ok="result" in env, length=len(text))
+                return {"action": "skip", "reason": "relay:hub-rpc"}
             kind = str(env.get("t") or "")
             if kind in ("inbound", "answer"):
                 body = str(env.get("text") or "").strip()
