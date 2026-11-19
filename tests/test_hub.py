@@ -386,7 +386,7 @@ def run() -> dict:
     assert res_send["jsonrpc"] == "2.0" and res_send["id"] == "r1", res_send
     task_view = res_send["result"]["task"]
     assert task_view["id"] and task_view["status"]["state"] == "auth-required", task_view
-    assert task_view["kind"] == "task" and task_view["artifacts"][0]["parts"][0]["text"]
+    assert task_view["kind"] == "task" and "привет, aa" in json.dumps(task_view, ensure_ascii=False)
     assert any(x["chat"] == OWNER and x["buttons"] for x in tg.sent), "карточка владельцу"
     res["rpc_message_send_auth_required"] = True
 
@@ -1290,6 +1290,13 @@ def run() -> dict:
     result, code = answer["v"]
     assert code == 0 and result["task"]["status"]["state"] == "completed", result
     assert result["task"]["history"][-1]["parts"][0]["text"] == "OK"
+    # artifacts = результат задачи (ответ агента), вход — в history
+    completed, _ = hub.http_rpc("GetTask", {"id": task_id}, client=cl)
+    outs = completed["task"]["artifacts"]
+    assert outs and outs[0]["parts"][0]["text"] == "OK", outs
+    assert completed["task"]["artifacts"][0]["artifactId"].endswith("-out")
+    roles = [m["role"] for m in completed["task"]["history"]]
+    assert roles == ["user", "agent"], roles
     res["a2a_native_wait"] = True
 
     # старый самодельный конверт больше не принимается

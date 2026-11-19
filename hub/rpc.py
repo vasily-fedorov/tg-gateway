@@ -54,14 +54,10 @@ def task_view(task: Any, *, history_length: Optional[int] = None,
     }
     if t["status"] == "skipped":
         view["metadata"]["skipped"] = True
-    if t.get("text"):
-        view["artifacts"] = [{"artifactId": f"{t['task_id']}-in", "parts": [
-            {"kind": "text", "text": t["text"]}]}]
-    if history_length is None and not a2a:
-        if t.get("answer"):
-            view["history"] = [{"role": "agent", "messageId": f"{t['task_id']}-a",
-                                "parts": [{"kind": "text", "text": t["answer"]}]}]
-        return view
+    # artifacts — результат задачи (ответ агента); вход — в history
+    if t.get("answer"):
+        view["artifacts"] = [{"artifactId": f"{t['task_id']}-out",
+                              "parts": [{"kind": "text", "text": t["answer"]}]}]
     messages = []
     if t.get("text"):
         messages.append({"role": "user", "messageId": f"{t['task_id']}-in",
