@@ -485,6 +485,7 @@ def run() -> dict:
     wire = [json.loads(x["text"]) for x in tg.sent
             if x["chat"] == AA and x["text"].startswith("{") and "method" in json.loads(x["text"])]
     assert wire[-1]["params"]["message"]["parts"][1]["kind"] == "data", wire[-1]
+    assert wire[-1]["params"]["metadata"]["protocolVersion"], wire[-1]
     res["data_part_delivered"] = True
 
     # поллинг: tasks/list по курсору

@@ -610,7 +610,8 @@ class Hub:
                 "message": {"role": "user", "messageId": "m-" + task_id,
                             "contextId": task["ctx"], "parts": parts},
                 "metadata": {"task": task_id, "hops": hops, "from": task["src_alias"],
-                             "sent_at": self.clock()},
+                             "sent_at": self.clock(),
+                             "protocolVersion": rpc.PROTOCOL_VERSION},
             },
         }
         ok, res = self.tg.send(int(target["bot_id"]),

@@ -1,216 +1,73 @@
-# tg-gateway
+# tg-gateway — хаб межагентного обмена
 
-Межагентный обмен через Telegram с подтверждением человеком: отдельный **бот-шлюз**
-(`hub/`) плюс **плагин агента** (`core.py`), который бывает двух видов — самостоятельный
-relay в супергруппе (`group`) и тонкий провод к шлюзу (`endpoint`).
-
-```
-                 ┌──────────── hub (отдельный бот) ─────────────┐
- агент A ─JSON─▶ │ карточка владельцу → клик → JSON агенту B     │ ◀─JSON─ агент B
-                 │ маршруты · политика ask/auto · лимиты · hop≤3 │
-                 └───────────────────────────────────────────────┘
-```
-
-## Хаб (`hub/`)
-
-- стандартная библиотека + SQLite, без внешних зависимостей;
-- с владельцем — ЛС, карточки с кнопками «Отправить/Отклонить»;
-- с агентами — ЛС, JSON-конверты (bot-to-bot);
-- маршруты, политика подтверждений, лимиты, глубина цепочки, аудит — всё здесь,
-  у агента этих данных больше нет;
-- мультитенантность: `bots`, `routes`, `tasks` привязаны к `owner_tg`.
-
-### Протокол hub ↔ агент
-
-Только JSON-RPC 2.0 (A2A v1.0-форма) поверх ЛС Telegram. Единственный формат —
-самодельных конвертов больше нет (совместимость с внешними не поддерживаем).
-
-Агент → хаб:
-
-```json
-{"jsonrpc":"2.0","id":"r-1","method":"message/send","params":{
-  "message":{"role":"user","messageId":"m-1","contextId":"ab12",
-             "parts":[{"kind":"text","text":"сколько места на /?"}]},
-  "to":"aa","metadata":{"hops":1}}}
-{"jsonrpc":"2.0","id":"u-1","method":"tasks/update","params":{
-  "task":"3fe6f7","contextId":"ab12","status":{"state":"completed"},
-  "artifact":{"parts":[{"kind":"text","text":"31 ГБ"}]}}}
-{"jsonrpc":"2.0","id":"s-1","method":"tasks/get","params":{"id":"3fe6f7"}}
-{"jsonrpc":"2.0","id":"c-1","method":"tasks/cancel","params":{"id":"3fe6f7"}}
-{"jsonrpc":"2.0","id":"k-1","method":"agent/card","params":{"alias":"aa"}}
-```
-
-Хаб → агент (доставка задачи, отмена, ответы на RPC):
-
-```json
-{"jsonrpc":"2.0","id":"d-1","method":"message/send","params":{
-  "message":{"role":"user","messageId":"m-3fe6f7","contextId":"ab12",
-             "parts":[{"kind":"text","text":"..."}]},
-  "metadata":{"task":"3fe6f7","hops":2,"from":"god"}}}
-{"jsonrpc":"2.0","id":"c-1","method":"tasks/cancel","params":{"id":"3fe6f7"}}
-{"jsonrpc":"2.0","id":"r-1","result":{"task":{"id":"3fe6f7","status":{"state":"auth-required"}}}}
-```
-
-Состояния по A2A: `auth-required` (ждём карточку владельца), `working`,
-`input-required`, `completed`, `failed`, `rejected`, `canceled`; наше `skipped`
-отдаётся как `completed` + `metadata.skipped`. Карточка владельцу = расширение
-(`capabilities.humanApproval: true`).
-
-Правила: `hop ≤ 3` (дальше отказ), `per_hour` на маршрут, `max_text`, фильтр секретов,
-карточка живёт 20 минут, продолжение по тому же `ctx` идёт без карточки при
-`policy=auto`, `skip` гасит цепочку.
-
-### Мультитенантность
-
-Один хаб обслуживает нескольких владельцев. Изоляция — по `owner_tg`:
-
-- `bots(owner_tg, alias)` — у каждого владельца свои алиасы; один и тот же алиас
-  «god» у двух владельцев = два разных бота;
-- `routes(owner_tg, src, dst)` — маршруты и политика свои у каждого;
-- `tasks.owner_tg` — карточка уходит **только** владельцу задачи, чужой клик
-  отклоняется (`card_unauthorized`);
-- бот принадлежит ровно одному владельцу (`bots.bot_id` — PK); попытка привязать
-  чужого бота отклоняется, освобождает `/unpair <алиас>`;
-- доступ закрыт по умолчанию: работают только tg_id из `TG_GATEWAY_OWNERS`
-  (`TG_GATEWAY_OPEN=0`); открытая регистрация (`/start`) — только если явно
-  выставить `TG_GATEWAY_OPEN=1`.
-
-Чего в MVP нет: квот на владельца, приглашений «только по коду», выгрузки аудита per
-tenant. Хаб по конструкции видит текст сообщений (он и есть доверенный посредник).
-
-### Связи между владельцами (cross-tenant)
-
-По умолчанию боты разных владельцев **изолированы**: маршрут ищется только в своём
-namespace (`bots.owner_tg` + `alias`). Чтобы связать двух ботов — двустороннее согласие:
-
-1. владелец B: `/share <алиас>` → одноразовый код `LINK-XXXX`;
-2. владелец A: `/link <код> <свой_алиас>` → создаётся связь A→B;
-3. дальше A шлёт `relay` с адресом `@username_бота_B`:
-   исходящую сторону подтверждает A (`policy_src`), входящую — B (`policy_dst`,
-   по умолчанию `ask`); при `auto` соответствующая карточка не рисуется;
-4. `/links` — список связей с политиками, `/unlink <id>` — разорвать.
-
-Приватность: A не видит список ботов B — только `@username` того бота, на которого
-выдали приглашение; алиасы B остаются в его namespace. Hop-бюджет, лимиты, фильтр
-секретов и аудит работают на обеих сторонах.
-
-### Команды владельца в ЛС с хабом
+Telegram-бот, который держит маршруты, подтверждения владельца и состояние задач между
+агентами. Плагин агента (Hermes) живёт отдельно: `../hermes-tg-gateway`.
 
 ```
-/pair <алиас>                код подключения бота → отправить боту «/pair <код> <алиас>»
+ агент A ─JSON-RPC─▶ хаб ─карточка─▶ владелец ─клик─▶ хаб ─JSON-RPC─▶ агент B
+                     ▲                                              │
+                     └──────── tasks/update (completed/skip/ask) ◀──┘
+```
+
+Транспорт — **Telegram DM** (бот-хаб ↔ бот-агент), протокол — **JSON-RPC 2.0 / A2A v1.0**.
+Спека: [`docs/protocol.md`](docs/protocol.md).
+
+## Что делает
+
+- привязка ботов одноразовым кодом (`/pair` → бот отправляет `/pair <код> <алиас>`);
+- маршруты с политикой подтверждений (`ask` — карточка владельцу, `auto` — продолжение без карточки);
+- карточки с кнопками в ЛС владельца; без клика ничего не уходит;
+- состояния задачи по A2A (`auth-required → working → input-required → completed|failed|rejected|canceled`), `skipped` = «нечего отвечать»;
+- лимиты (`max_text`, `per_hour`), глубина цепочки (hops ≤ 3), TTL конверта 300 с, дедуп по `messageId` и по отпечатку содержимого;
+- здоровье пиров: 3 неудачные доставки → блокировка на 5 минут;
+- мультитенантность: у каждого владельца свои боты, маршруты, задачи, аудит; связи между владельцами — `/share` + `/link` с подтверждением с двух сторон;
+- части сообщения: `text`, `data` (JSON), `file` (только ссылка, бинарь не передаётся).
+
+## Команды владельца (в ЛС с ботом-хабом)
+
+```
+/pair <алиас>                код привязки бота
 /bots                        подключённые боты
 /routes                      маршруты и политика
-/route <от> <кому> ask|auto  политика ('-' = владелец)
-/cancel <task_id>            отменить задачу
-/unpair <алиас>              отключить бота
-/share <алиас>               код приглашения для связи с чужим владельцем
-/link <код> <мой_алиас>      связать своего бота с ботом другого владельца
-/links                       межвладельческие связи
-/unlink <id>                 разорвать связь
+/route <от> <кому> ask|auto  изменить политику ('-' = владелец)
+/log [алиас] [N]             последние задачи: пришедшие и отправленные
+/task <id>                   детали задачи и её события
+/protocol                    протокол в формате для агента
+/card [алиас]                A2A-карточка хаба или бота
+/describe <алиас> <текст>    что бот умеет (попадёт в карточку)
+/share <алиас>               приглашение для связи с чужим владельцем
+/link <код> <мой_алиас>      связать своего бота с чужим
+/links, /unlink <id>         список и разрыв связей
+/cancel <id>, /unpair <алиас>
 /help
 ```
 
-### Запуск
+## Запуск
 
 ```bash
 mkdir -p ~/tg-gateway && chmod 700 ~/tg-gateway
 cat > ~/tg-gateway/.env <<'EOF'
 TG_GATEWAY_TOKEN=<токен бота-хаба>
-TG_GATEWAY_OWNERS=100000001
-TG_GATEWAY_OPEN=0
-TG_GATEWAY_DB=/home/user/tg-gateway/hub.sqlite3
+TG_GATEWAY_OWNERS=<tg_id владельца>
+TG_GATEWAY_OPEN=0          # 1 — разрешить самостоятельную регистрацию владельцев
+TG_GATEWAY_DB=/home/<user>/tg-gateway/hub.sqlite3
+TG_GATEWAY_PROXY=<http-прокси>  # если до api.telegram.org нужен прокси
 EOF
 chmod 600 ~/tg-gateway/.env
-set -a; . ~/tg-gateway/.env; set +a
-python3 -m hub.app
+bash deploy/install.sh     # user-unit tg-gateway-hub
 ```
 
-Боту-хабу в @BotFather нужен включённый **Bot-to-Bot Communication Mode** — иначе
-агентские боты не смогут ему писать. Group Privacy не важен: работа идёт в ЛС.
-
-systemd: `deploy/tg-gateway-hub.service` (user unit) + `deploy/install.sh`.
-
-## Плагин агента (`core.py`)
-
-Два режима, переключаются полем `mode` в `gateway-routes.json`.
-
-### `mode: "group"` (по умолчанию, 0.2)
-
-Самостоятельный relay в форум-супергруппе, карточки — в ЛС владельца
-(`approvals_chat`) или в топик подтверждений (`approvals_thread`).
-
-| | |
-|---|---|
-| **Отправка** | `relay_send(target, text)` паркует задачу и рисует карточку; отправляет только клик владельца |
-| **Приём** | сообщение бота не доходит до модели: хук паркует задачу и рисует карточку «Принять?»; после клика — тихий ход профиля |
-| **Вопрос своему профилю** | `ask_default(question)` — тихий ход CLI, аргументы списком, без `shell=True` |
-| **Отмена** | `relay_cancel(task_id)` → карточка → `cancelled` + уведомление пиру `#cancel` |
-| **Инбокс** | `gateway_inbox(ack)` — только недоставленное/ждущее владельца |
-
-Состояния: `submitted → working → (input-required → working)* → completed | failed |
-rejected | cancelled | skipped`. Два TTL: карточка 20 мин, задача 24 ч.
-
-### `mode: "endpoint"`
-
-```json
-{"mode": "endpoint", "hub": {"bot_id": 123456789, "username": "gateway_hub_bot"}}
-```
-
-Агент не рисует карточек и не читает группу: принимает только конверты от `hub.bot_id`,
-ответы (`done`/`ask`/`skip`) отправляет хабу. Реестр `bots` не нужен — маршруты в хабе.
-
-## Безопасность (не зависит от поведения модели)
-
-1. Адресаты структурны: только ключи реестра (в `group`) или маршруты хаба (в `endpoint`).
-2. Кнопка = подтверждение; колбэк проверяет `owner_ids`. Кодов `APPROVE` нет.
-3. Входящее изолировано: чужой чат, бот вне реестра, сообщение без `@нашего_бота`,
-   чужая clarify-карточка → `skip` + аудит.
-4. Фильтры утечек/инъекций на исходящем тексте.
-5. Анти-петля: метка `[gw ctx:<id> #N]`, `hop > 3` не принимается, `SKIP` гасит цепочку.
-6. Аудит: `logs/gateway-relay-audit.jsonl` (агент) и таблица `events` (хаб) — hash и
-   длина, не текст.
-
-MCP-серверы не нужны; shell/файловых/сетевых инструментов плагин не даёт.
-
-## Установка плагина
-
-```bash
-hermes plugins install <owner>/<repo> --enable
-# локально: скопировать каталог в <home>/plugins/gateway-relay
-```
-
-Плагин ставится в **два** дома для режима `group`:
-
-- `<profile-home>/plugins/gateway-relay` — профиль `gateway`: инструменты и watcher;
-- `<launch-home>/plugins/gateway-relay` — профиль запуска: только хук и фабрика
-  callback-хендлера (иначе кнопки не работают).
-
-```yaml
-plugins:
-  enabled: [gateway-relay]
-  entries:
-    gateway-relay:
-      allow_gateway_injection: true
-platforms:
-  telegram:
-    allow_bots: mentions
-    bots_require_mention: true
-    group_allowed_chats: ['-100…']
-    group_policy: mention_only
-platform_toolsets:
-  telegram: [clarify, gateway_relay]
-```
-
-## Ограничения Hermes, которые обходим осознанно
-
-- `require_mention` резолвится из профиля запуска, а не маршрутизированного → гейт в хуке.
-- `PluginContext.inject_message` не будит чат чужого профиля → тихий ход профиля.
-- `send_clarify` всегда пишет в топик сессии → карточки рисует плагин.
+Боту в @BotFather нужны: **Bot-to-Bot Communication Mode** и членство в одной группе с
+ботами-агентами (Telegram открывает bot-to-bot DM только при общем чате).
 
 ## Тесты
 
 ```bash
-python3 tests/test_state.py               # машина состояний (9 групп)
-python3 tests/test_gateway_relay_hook.py  # хук/карточки/endpoint (22 группы)
-python3 tests/test_hub.py                 # хаб: pairing, карточки, лимиты, TTL (11)
+python3 tests/test_hub.py
 ```
+
+## Аудит
+
+SQLite-таблица `events`: `relay_parked`, `card_approved`, `delivered`, `reply_parked`,
+`task_skipped`, `ttl_rejected`, `rpc_dedup`, `hop_limit`, `peer_blocked`,
+`card_unauthorized`, `owner_log`, `hub_error`. Пишутся hash/длины, не текст.
