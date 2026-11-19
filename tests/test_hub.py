@@ -26,6 +26,7 @@ class FakeTg:
         self.sent: list[dict] = []
         self.edits: list[tuple] = []
         self.callbacks: list[tuple] = []
+        self.calls: list[tuple] = []
 
     def send(self, chat_id, text, buttons=None, **kwargs):
         self.sent.append({"chat": chat_id, "text": text, "buttons": buttons})
@@ -40,6 +41,10 @@ class FakeTg:
 
     def get_updates(self, offset, timeout=30):
         return []
+
+    def call(self, method, **params):
+        self.calls.append((method, params))
+        return True, {"ok": True}
 
 
 def msg(uid: int, text: str, *, is_bot: bool = False, chat_type: str = "private",
@@ -532,6 +537,38 @@ def run() -> dict:
     rpc_proto = rpc_call("pp-1", "agent/protocol", {})
     assert "TG-GATEWAY" in rpc_proto["result"]["protocol"]
     res["owner_log_task_protocol"] = True
+
+    # 10l. автодополнение команд, inline-меню, /describe
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    assert hub.install_commands() is True
+    method, params = tg.calls[-1]
+    names = [c["command"] for c in json.loads(params["commands"])]
+    assert method == "setMyCommands", method
+    assert "menu" in names and "describe" in names and len(names) <= 32, names
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='commands_published'")
+    res["commands_published"] = True
+
+    hub.handle(msg(OWNER, "/menu"))
+    menu = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
+    flat = [btn[1] for row in menu["buttons"] for btn in row]
+    assert "hub:menu:bots" in flat and "hub:menu:protocol" in flat, flat
+    hub.handle(cb(OWNER, "hub:menu:bots", message_id=5))
+    assert "Подключённые боты" in tg.sent[-1]["text"] and "god" in tg.sent[-1]["text"]
+    hub.handle(cb(OWNER, "hub:menu:protocol", message_id=5))
+    assert "message/send" in tg.sent[-1]["text"]
+    res["inline_menu"] = True
+
+    hub.handle(msg(OWNER, "/describe"))
+    assert "Описания" in tg.sent[-1]["text"] or "Ботов нет" in tg.sent[-1]["text"]
+    hub.handle(msg(OWNER, "/describe god"))
+    assert "«god»:" in tg.sent[-1]["text"] and "Задать" in tg.sent[-1]["text"], tg.sent[-1]["text"]
+    hub.handle(msg(OWNER, "/describe god смотрит диск и логи"))
+    assert "✅" in tg.sent[-1]["text"], tg.sent[-1]["text"]
+    assert (hub.db.bot_by_alias(OWNER, "god")["description"] or "").startswith("смотрит диск")
+    hub.handle(msg(OWNER, "/describe god"))
+    assert "смотрит диск" in tg.sent[-1]["text"]
+    res["describe_three_forms"] = True
 
     # старый самодельный конверт больше не принимается
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])

@@ -17,7 +17,7 @@ import sys
 import time
 from typing import Any, Dict, Iterable, Optional
 
-from . import policy, protocol, rpc
+from . import commands, policy, protocol, rpc
 from .db import CARD_TTL_S, TERMINAL, Db
 from .tg import Tg
 
@@ -110,7 +110,9 @@ class Hub:
         self.db.ensure_owner(uid)
         low = text.lower()
         if low in ("/start", "/help", "help", "помощь"):
-            return self.say(uid, HELP)
+            return self.say(uid, commands.help_text())
+        if low == "/menu":
+            return self.tg.send(uid, "Главное меню:", commands.MENU_ROWS)
         if low.startswith("/pair"):
             parts = text.split()
             if len(parts) < 2:
@@ -189,13 +191,27 @@ class Hub:
             return self.say(uid, "\n".join(body))
         if low.startswith("/describe"):
             parts = text.split(maxsplit=2)
-            if len(parts) < 2:
-                return self.say(uid, "Использование: /describe <алиас> <что умеет>")
-            desc = parts[2] if len(parts) > 2 else ""
-            if not self.db.set_description(uid, parts[1].strip(), desc):
+            if len(parts) == 1:
+                rows = self.db.bots(uid)
+                if not rows:
+                    return self.say(uid, "Ботов нет. /pair <алиас>")
+                lines = [f"• {r['alias']} — {(r['description'] or '').strip() or '— нет описания —'}"
+                         for r in rows]
+                return self.say(uid, "Описания (для agent card):\n" + "\n".join(lines) +
+                                "\n\nЗадать: /describe <алиас> <что умеет>")
+            alias = parts[1].strip()
+            bot = self.db.bot_by_alias(uid, alias)
+            if not bot:
+                return self.say(uid, f"Бота «{alias}» нет. /bots")
+            if len(parts) == 2 or not parts[2].strip():
+                current = (bot["description"] or "").strip() or "— нет описания —"
+                return self.say(uid, f"«{alias}»: {current}\n\n"
+                                     f"Задать: /describe {alias} <что умеет>")
+            if not self.db.set_description(uid, alias, parts[2].strip()):
                 return self.say(uid, "Такого бота нет.")
-            self.db.event("bot_described", owner=uid, alias=parts[1])
-            return self.say(uid, f"Навык «{parts[1]}» обновлён — попадёт в agent card.")
+            self.db.event("bot_described", owner=uid, alias=alias)
+            return self.say(uid, f"✅ «{alias}» умеет: {parts[2].strip()[:120]}\n"
+                                 "Это попадёт в agent card (/card " + alias + ").")
         if low.startswith("/card"):
             parts = text.split()
             if len(parts) > 1:
@@ -319,6 +335,13 @@ class Hub:
             return self.say(bot_id, rpc.rpc_err(env.get("id"), rpc.ERR_INVALID_REQUEST,
                                                 "нужен JSON-RPC 2.0 (method/params)"))
         return self.on_rpc(bot, env)
+
+    def install_commands(self) -> bool:
+        """Подсказки команд в Telegram: без этого «/» ничего не автодополняет."""
+        ok, info = self.tg.call("setMyCommands", commands=json.dumps(commands.bot_commands(),
+                                                                   ensure_ascii=False))
+        self.db.event("commands_published", ok=bool(ok), error=None if ok else str(info)[:200])
+        return bool(ok)
 
     def _notify_cancel(self, alias: str, owner: int, task_id: str) -> bool:
         payload = {"jsonrpc": "2.0", "id": "c-" + new_id(3), "method": "tasks/cancel",
@@ -685,6 +708,9 @@ class Hub:
         if len(parts) != 3 or parts[0] != "hub":
             return self.tg.answer_callback(cb_id, "Непонятная карточка")
         _, verdict, task_id = parts
+        if verdict == "menu":          # разделы inline-меню — до всякой работы с задачами
+            self.tg.answer_callback(cb_id, "")
+            return self.send_menu_section(uid, chat_id, task_id)
         task = self.db.task(task_id)
         if not task:
             self.tg.answer_callback(cb_id, "Задача не найдена")
@@ -741,6 +767,37 @@ class Hub:
         self.finish_card(chat_id, msg_id,
                          f"✅ Отправлено → {task['dst_alias']}" if ok else "❌ Не доставлено")
 
+    def send_menu_section(self, uid: int, chat_id: Any, section: str) -> None:
+        """Разделы inline-меню: текст + кнопки «назад»."""
+        if section == "bots":
+            rows = self.db.bots(uid)
+            text = ("Подключённые боты:\n" + "\n".join(
+                f"• {r['alias']} — @{r['username']} (id {r['bot_id']})" for r in rows)
+                if rows else "Ботов нет. /pair <алиас>")
+        elif section == "routes":
+            rows = self.db.routes(uid)
+            text = ("Маршруты:\n" + "\n".join(
+                f"• {r['src_alias'] or 'вы'} → {r['dst_alias']}: {r['policy']} "
+                f"({r['per_hour']}/час)" for r in rows)
+                if rows else "Маршрутов нет. /route <от> <кому> ask|auto")
+        elif section == "log":
+            rows = self.db.q("SELECT * FROM tasks WHERE owner_tg=? ORDER BY created_at DESC LIMIT 10",
+                             (uid,))
+            text = ("Последние задачи:\n" + "\n".join(
+                f"{r['task_id']}  {r['src_alias']}→{r['dst_alias']}  {r['status']}  h{r['hops']}"
+                for r in rows) if rows else "Задач нет.")
+        elif section == "links":
+            rows = self.db.links_for_owner(uid)
+            text = ("Связи:\n" + "\n".join(
+                f"• #{r['id']} @{r['src_username']} → @{r['dst_username']}" for r in rows)
+                if rows else "Связей нет. /share <алиас>")
+        elif section == "protocol":
+            text = protocol.AGENT_PROTOCOL
+        else:
+            text = commands.help_text()
+        self.tg.send(chat_id or uid, text[:3900],
+                     [[("⬅️ Меню", "hub:menu:help"), ("❌ Закрыть", "hub:menu:close")]])
+
     def finish_card(self, chat_id: Any, msg_id: Any, text: str) -> None:
         if chat_id and msg_id:
             self.tg.edit(chat_id, int(msg_id), text)
@@ -777,6 +834,8 @@ def main() -> int:
               open_registration=open_reg, proxy=proxy)
     print(f"hub: db={db_path} owners={sorted(hub.owners)} proxy={'yes' if proxy else 'no'}",
           flush=True)
+    if hub.install_commands():
+        print("hub: команды опубликованы в Telegram (автодополнение включено)", flush=True)
     hub.run()
     return 0
 
