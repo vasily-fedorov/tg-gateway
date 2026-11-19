@@ -949,6 +949,74 @@ def run() -> dict:
         os.environ.pop("TG_GATEWAY_A2A_POLICY", None)
     res["a2a_policy_from_config"] = True
 
+    # 10u. контекст ветки (A2A contextId): выжимка в parts, historyLength, ListTasks
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    pair(hub, tg, bot_id=GOD, alias="god")
+    hub._a2a_public_url = lambda: "http://127.0.0.1:18765"
+    hub.db.set_route(OWNER, "aa", "god", policy="auto")
+
+    # первый ход ветки — контекста ещё нет
+    t1, _ = hub.http_rpc("SendMessage", {"to": "aa",
+                                         "message": {"contextId": "ctx-flow-1",
+                                                     "parts": [{"kind": "text",
+                                                                "text": "первый вопрос"}]}})
+    first_id = t1["task"]["id"]
+    hub.handle(cb(OWNER, f"hub:ok:{first_id}"))
+    first_payload = json.loads([x for x in tg.sent if x["chat"] == AA][-1]["text"])
+    assert "context" not in [p.get("kind") for p in first_payload["params"]["message"]["parts"]]
+
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "u-ctx1", "method": "tasks/update",
+                                   "params": {"task": first_id,
+                                              "status": {"state": "completed"},
+                                              "artifact": {"parts": [{"kind": "text",
+                                                                      "text": "первый ответ"}]}}}),
+                   is_bot=True, username="aa"))
+
+    # второй ход в той же ветке: боту приходит выжимка первого
+    t2, _ = hub.http_rpc("SendMessage", {"to": "aa",
+                                         "message": {"contextId": "ctx-flow-1",
+                                                     "parts": [{"kind": "text",
+                                                                "text": "второй вопрос"}]}})
+    hub.handle(cb(OWNER, f"hub:ok:{t2['task']['id']}"))
+    second_payload = json.loads([x for x in tg.sent if x["chat"] == AA][-1]["text"])
+    parts = second_payload["params"]["message"]["parts"]
+    digest = [p for p in parts if p.get("kind") == "data" and "context" in (p.get("data") or {})]
+    assert digest, parts
+    assert digest[0]["data"]["context"][0]["question"] == "первый вопрос"
+    assert digest[0]["data"]["context"][0]["answer"] == "первый ответ"
+    assert second_payload["params"]["metadata"]["contextTurns"] == 1
+
+    # historyLength: 0 — без истории, 1 — только последнее, None — оба
+    got0, _ = hub.http_rpc("GetTask", {"id": first_id, "historyLength": 0})
+    assert "history" not in got0["task"], got0
+    got1, _ = hub.http_rpc("GetTask", {"id": first_id, "historyLength": 1})
+    assert len(got1["task"]["history"]) == 1 and got1["task"]["history"][0]["role"] == "agent"
+    gotall, _ = hub.http_rpc("GetTask", {"id": first_id})
+    roles = [m["role"] for m in gotall["task"]["history"]]
+    assert roles == ["user", "agent"], roles
+
+    # ListTasks по contextId
+    listed, _ = hub.http_rpc("ListTasks", {"contextId": "ctx-flow-1"})
+    ids = {t["id"] for t in listed["tasks"]}
+    assert {first_id, t2["task"]["id"]} <= ids, ids
+    assert all(t["contextId"] == "ctx-flow-1" for t in listed["tasks"])
+
+    # выключение контекста на маршруте убирает выжимку
+    hub.db.set_route(OWNER, "", "aa", policy="ask")
+    route_id = hub.db.route(OWNER, "", "aa")["id"]
+    hub.handle(cb(OWNER, f"hub:rctx:{route_id}", message_id=55))
+    assert hub.db.route(OWNER, "", "aa")["context_mode"] == "off"
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='route_context_changed'")
+    t3, _ = hub.http_rpc("SendMessage", {"to": "aa",
+                                         "message": {"contextId": "ctx-flow-1",
+                                                     "parts": [{"kind": "text", "text": "третий"}]}})
+    hub.handle(cb(OWNER, f"hub:ok:{t3['task']['id']}"))
+    third_payload = json.loads([x for x in tg.sent if x["chat"] == AA][-1]["text"])
+    kinds = [x.get("kind") for x in third_payload["params"]["message"]["parts"]]
+    assert "data" not in kinds, kinds
+    res["a2a_context_thread"] = True
+
     # старый самодельный конверт больше не принимается
     hub, tg = new_hub()
     pair(hub, tg, bot_id=GOD, alias="god")

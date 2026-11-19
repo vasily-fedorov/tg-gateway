@@ -31,7 +31,8 @@ def a2a_state(status: str) -> str:
     return STATE_MAP.get(str(status), "unknown")
 
 
-def task_view(task: Any) -> Dict[str, Any]:
+def task_view(task: Any, *, history_length: Optional[int] = None,
+              a2a: bool = False) -> Dict[str, Any]:
     """A2A Task из строки БД."""
     t = dict(task)
     state = a2a_state(t["status"])
@@ -56,9 +57,25 @@ def task_view(task: Any) -> Dict[str, Any]:
     if t.get("text"):
         view["artifacts"] = [{"artifactId": f"{t['task_id']}-in", "parts": [
             {"kind": "text", "text": t["text"]}]}]
+    if history_length is None and not a2a:
+        if t.get("answer"):
+            view["history"] = [{"role": "agent", "messageId": f"{t['task_id']}-a",
+                                "parts": [{"kind": "text", "text": t["answer"]}]}]
+        return view
+    messages = []
+    if t.get("text"):
+        messages.append({"role": "user", "messageId": f"{t['task_id']}-in",
+                         "parts": [{"kind": "text", "text": t["text"]}]})
     if t.get("answer"):
-        view["history"] = [{"role": "agent", "messageId": f"{t['task_id']}-a",
-                            "parts": [{"kind": "text", "text": t["answer"]}]}]
+        messages.append({"role": "agent", "messageId": f"{t['task_id']}-a",
+                         "parts": [{"kind": "text", "text": t["answer"]}]})
+    if history_length is None:          # A2A: не задано = без ограничения
+        limit = len(messages) or 1
+    else:
+        limit = int(history_length or 0)
+    messages = [] if limit == 0 else messages[-limit:]
+    if messages:
+        view["history"] = messages
     return view
 
 

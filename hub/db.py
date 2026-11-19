@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS routes (
     policy      TEXT NOT NULL DEFAULT 'ask',   -- ask | auto
     max_text    INTEGER NOT NULL DEFAULT 3000,
     per_hour    INTEGER NOT NULL DEFAULT 20,
+    context_mode TEXT NOT NULL DEFAULT '',  -- on | off | '' (по умолчанию on)
     created_at  REAL NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS routes_pair ON routes(owner_tg, src_alias, dst_alias);
@@ -130,6 +131,9 @@ class Db:
             self.run("ALTER TABLE bots ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         if "a2a_policy" not in cols:
             self.run("ALTER TABLE bots ADD COLUMN a2a_policy TEXT NOT NULL DEFAULT ''")
+        rcols = {r["name"] for r in self.q("PRAGMA table_info(routes)")}
+        if "context_mode" not in rcols:
+            self.run("ALTER TABLE routes ADD COLUMN context_mode TEXT NOT NULL DEFAULT ''")
         self.run(
             "CREATE TABLE IF NOT EXISTS inbox_msgs (message_id TEXT PRIMARY KEY, task_id TEXT, "
             "created_at REAL NOT NULL)")
@@ -311,6 +315,17 @@ class Db:
     def route(self, owner: int, src: str, dst: str) -> Optional[sqlite3.Row]:
         return self.one("SELECT * FROM routes WHERE owner_tg=? AND src_alias=? AND dst_alias=?",
                         (owner, src, dst))
+
+    def set_context_mode(self, owner: int, route_id: int, mode: str) -> None:
+        self.run("UPDATE routes SET context_mode=? WHERE id=? AND owner_tg=?",
+                 (mode if mode in ("on", "off") else "", int(route_id), owner))
+
+    def context_turns(self, owner: int, ctx: str, *, before: float, limit: int = 5) -> list:
+        """Предыдущие ходы ветки: (вопрос, ответ) по времени."""
+        return self.q(
+            "SELECT src_alias, dst_alias, text, answer, status, created_at FROM tasks "
+            "WHERE owner_tg=? AND ctx=? AND created_at < ? AND status NOT IN ('failed','rejected') "
+            "ORDER BY created_at DESC LIMIT ?", (owner, ctx, before, int(limit)))
 
     def set_route(self, owner: int, src: str, dst: str, *, policy: str = "ask",
                   max_text: int = 3000, per_hour: int = 20) -> None:

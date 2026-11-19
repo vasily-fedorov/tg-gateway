@@ -625,13 +625,16 @@ class Hub:
             parts.extend(json.loads(task["attachments"] or "[]"))
         except ValueError:
             pass
+        turns = self.context_digest(task)
+        if turns:
+            parts.append({"kind": "data", "data": {"context": turns}})
         payload = {
             "jsonrpc": "2.0", "id": "d-" + new_id(4), "method": "message/send",
             "params": {
                 "message": {"role": "user", "messageId": "m-" + task_id,
                             "contextId": task["ctx"], "parts": parts},
                 "metadata": {"task": task_id, "hops": hops, "from": task["src_alias"],
-                             "sent_at": self.clock(),
+                             "sent_at": self.clock(), "contextTurns": len(turns),
                              "protocolVersion": rpc.PROTOCOL_VERSION},
             },
         }
@@ -646,6 +649,33 @@ class Hub:
         self.db.event("delivered" if ok else "deliver_failed", task_id=task_id,
                       to=task["dst_alias"], hops=hops, error=None if ok else str(res)[:200])
         return bool(ok)
+
+    def context_digest(self, task: Any) -> list:
+        """Выжимка предыдущих ходов ветки (contextId) — хаб как оркестратор A2A.
+
+        Не общая память: только эта ветка, только для получателя, лимит 5 ходов и
+        240 символов на поле. Выключается маршрутом (`context_mode='off'`).
+        """
+        owner = int(task["owner_tg"])
+        dst = str(task["dst_alias"] or "")
+        route = (self.db.route(owner, str(task["src_alias"] or ""), dst)
+                 or self.db.route(owner, "", dst))
+        mode = str(route["context_mode"] or "") if route else ""
+        if mode.strip().lower() == "off":
+            return []
+        if not str(task["ctx"] or "").strip():
+            return []
+        rows = self.db.context_turns(owner, str(task["ctx"]), before=float(task["created_at"]))
+        turns = []
+        for row in reversed(rows):          # хронологический порядок
+            question = " ".join(str(row["text"] or "").split())[:240]
+            answer = " ".join(str(row["answer"] or "").split())[:240]
+            if not question and not answer:
+                continue
+            turns.append({"from": row["src_alias"], "to": row["dst_alias"],
+                          "question": question, "answer": answer,
+                          "state": row["status"]})
+        return turns
 
     # ── ответ агента ─────────────────────────────────────────────────────────
     def _is_a2a_task(self, task: Any) -> bool:
@@ -682,13 +712,29 @@ class Hub:
             task = self.db.task(str(params.get("id") or ""))
             if not task or int(task["owner_tg"]) != owner:
                 return {"message": "задача не найдена"}, rpc.ERR_TASK_NOT_FOUND
-            return {"task": rpc.task_view(task)}, 0
+            raw_len = params.get("historyLength")
+            try:
+                history_length = None if raw_len is None else int(raw_len)
+            except (TypeError, ValueError):
+                history_length = None
+            return {"task": rpc.task_view(task, history_length=history_length,
+                                          a2a=True)}, 0
 
         if method in ("tasks/list", "tasks/poll"):
             since = float(params.get("since") or 0)
-            rows = self.db.q("SELECT * FROM tasks WHERE owner_tg=? AND updated_at > ? "
-                             "ORDER BY updated_at LIMIT ?",
-                             (owner, since, int(params.get("limit") or 50)))
+            ctx = str(params.get("contextId") or "").strip()
+            status = str(params.get("status") or "").strip()
+            sql = "SELECT * FROM tasks WHERE owner_tg=? AND updated_at > ?"
+            args: list = [owner, since]
+            if ctx:
+                sql += " AND ctx=?"
+                args.append(ctx)
+            if status:
+                sql += " AND status=?"
+                args.append(status)
+            sql += " ORDER BY updated_at LIMIT ?"
+            args.append(int(params.get("limit") or 50))
+            rows = self.db.q(sql, tuple(args))
             cursor = max([float(r["updated_at"]) for r in rows], default=since)
             return {"tasks": [rpc.task_view(r) for r in rows], "cursor": cursor}, 0
 
@@ -864,7 +910,7 @@ class Hub:
             self.tg.answer_callback(cb_id, "")
             return self.send_menu_section(uid, chat_id, msg_id, task_id)
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
-                       "desc", "new", "newr", "rdel", "rdelok", "tfull", "a2apol"):
+                       "desc", "new", "newr", "rdel", "rdelok", "tfull", "a2apol", "rctx"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -885,6 +931,8 @@ class Hub:
                 return self.do_route_delete(uid, chat_id, msg_id, task_id)
             if verdict == "tfull":
                 return self.send_task_full(uid, chat_id, task_id)
+            if verdict == "rctx":
+                return self.toggle_context(uid, chat_id, msg_id, task_id)
             if verdict == "a2apol":
                 return self.toggle_a2a_policy(uid, chat_id, msg_id, task_id)
             if verdict == "task":
@@ -1126,6 +1174,7 @@ class Hub:
         if not route:
             return self._show(uid, chat, msg_id, "Маршрут не найден.", back)
         policy = str(route["policy"])
+        ctx_mode = str(route["context_mode"] or "on").strip().lower()
         per_hour = int(route["per_hour"])
         next_limit = next((x for x in (5, 20, 50, 100) if x > per_hour), 5)
         next_max = next((x for x in (1000, 2000, 3000, 4000) if x > int(route["max_text"])), 1000)
@@ -1133,9 +1182,12 @@ class Hub:
                 f"политика: {policy} "
                 f"({'спрашивать владельца' if policy == 'ask' else 'продолжения без карточки'})\n"
                 f"лимит: {per_hour}/час · max_text: {route['max_text']}\n"
+                f"контекст ветки: {'вкл (последние 5 ходов)' if ctx_mode != 'off' else 'выкл'}\n"
                 f"id: {route['id']}")
         rows = [
             [(f"Политика → {'auto' if policy == 'ask' else 'ask'}", f"hub:rpol:{route['id']}")],
+                    [(f"🧠 Контекст → {'выкл' if ctx_mode == 'off' else 'вкл'}",
+                      f"hub:rctx:{route['id']}")],
             [(f"Лимит → {next_limit}/час", f"hub:rlim:{route['id']}")],
             [(f"max_text → {next_max}", f"hub:rmax:{route['id']}")],
             [("🗑 Удалить маршрут", f"hub:rdel:{route['id']}")],
@@ -1143,6 +1195,16 @@ class Hub:
         ]
         self.db.event("menu_route", owner=uid, route=int(route["id"]))
         self._show(uid, chat, msg_id, text, rows)
+
+    def toggle_context(self, uid: int, chat: Any, msg_id: Any, route_id: str) -> None:
+        route = self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
+                            (int(route_id), uid)) if str(route_id).isdigit() else None
+        if not route:
+            return self.send_menu_section(uid, None, msg_id, "routes")
+        new_mode = "on" if str(route["context_mode"] or "on").strip().lower() == "off" else "off"
+        self.db.set_context_mode(uid, int(route["id"]), new_mode)
+        self.db.event("route_context_changed", owner=uid, route=int(route["id"]), mode=new_mode)
+        self.send_route(uid, None, msg_id, route_id)
 
     def toggle_route(self, uid: int, chat: Any, msg_id: Any, route_id: str, kind: str) -> None:
         route = self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
