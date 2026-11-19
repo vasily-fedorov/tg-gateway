@@ -290,8 +290,17 @@ class Hub:
         if low.startswith("/cancel"):
             parts = text.split()
             if len(parts) < 2:
+                if self.db.get_state(uid):
+                    self.db.clear_state(uid)
+                    return self.say(uid, "Ввод отменён.")
                 return self.say(uid, "Использование: /cancel <task_id>")
             return self.cancel_task(uid, parts[1])
+        # ввод для начатого в меню действия (кнопки не умеют принимать текст)
+        if not text.startswith("/"):
+            st = self.db.get_state(uid)
+            if st:
+                return self.handle_state_input(uid, str(st["action"]), str(st["payload"] or ""), text)
+
         # ответ на висящий вопрос агента
         pending = self.db.q("SELECT * FROM tasks WHERE owner_tg=? AND status='input-required' "
                             "ORDER BY created_at DESC LIMIT 1", (uid,))
@@ -711,14 +720,19 @@ class Hub:
         if verdict == "menu":          # разделы inline-меню — до всякой работы с задачами
             self.tg.answer_callback(cb_id, "")
             return self.send_menu_section(uid, chat_id, msg_id, task_id)
-        if verdict in ("card", "route", "rpol", "rlim", "task", "tcancel"):
+        if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
+                       "desc", "new"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
             if verdict == "route":
                 return self.send_route(uid, chat_id, msg_id, task_id)
-            if verdict in ("rpol", "rlim"):
+            if verdict in ("rpol", "rlim", "rmax"):
                 return self.toggle_route(uid, chat_id, msg_id, task_id, verdict)
+            if verdict == "desc":
+                return self.begin_describe(uid, chat_id, msg_id, task_id)
+            if verdict == "new":
+                return self.begin_new(uid, chat_id, msg_id, task_id)
             if verdict == "task":
                 return self.send_task_card(uid, chat_id, msg_id, task_id)
             if verdict == "tcancel":
@@ -779,6 +793,78 @@ class Hub:
         self.finish_card(chat_id, msg_id,
                          f"✅ Отправлено → {task['dst_alias']}" if ok else "❌ Не доставлено")
 
+    def begin_describe(self, uid: int, chat: Any, msg_id: Any, alias: str) -> None:
+        if not self.db.bot_by_alias(uid, alias):
+            return self.send_bot_card(uid, chat, msg_id, alias)
+        self.db.set_state(uid, "describe", alias)
+        self._show(uid, chat, msg_id,
+                   f"Пришлите описание для «{alias}» одним сообщением — что он умеет.\n"
+                   "Оно попадёт в agent card. Написать /cancel — отменить.",
+                   [[("⬅️ Бот", f"hub:card:{alias}"), ("❌ Закрыть", "hub:menu:close")]])
+
+    def begin_new(self, uid: int, chat: Any, msg_id: Any, kind: str) -> None:
+        if kind == "pair":
+            self.db.set_state(uid, "pair_alias")
+            self._show(uid, chat, msg_id,
+                       "Пришлите алиас нового бота (например aa).\n"
+                       "Я выдам одноразовый код — его нужно отправить боту сообщением "
+                       "«/pair <код> <алиас>». /cancel — отменить.",
+                       [[("⬅️ Боты", "hub:menu:bots"), ("❌ Закрыть", "hub:menu:close")]])
+            return
+        self.db.set_state(uid, "new_route")
+        self._show(uid, chat, msg_id,
+                   "Пришлите маршрут одной строкой: <от> <кому> [ask|auto]\n"
+                   "«-» вместо отправителя = вы. Пример: god aa ask",
+                   [[("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")]])
+
+    def handle_state_input(self, uid: int, action: str, payload: str, text: str) -> None:
+        """Текст, присланный в ответ на запрос из меню."""
+        value = text.strip()
+        if value.lower() in ("/cancel", "отмена", "cancel"):
+            self.db.clear_state(uid)
+            return self.say(uid, "Ввод отменён.")
+
+        if action == "describe":
+            alias = payload
+            ok = self.db.set_description(uid, alias, value)
+            self.db.clear_state(uid)
+            if not ok:
+                return self.say(uid, "Такого бота нет — ввод сброшен.")
+            self.db.event("bot_described", owner=uid, alias=alias, via="menu")
+            return self.send_bot_card(uid, uid, None, alias)
+
+        if action == "pair_alias":
+            alias = value[:20]
+            if self.db.bot_by_alias(uid, alias):
+                return self.say(uid, f"«{alias}» уже подключён. Пришлите другой алиас или /cancel.")
+            code = "HUB-" + secrets.token_hex(2).upper()
+            self.db.add_pair_code(uid, alias, code)
+            self.db.clear_state(uid)
+            self.db.event("pair_code_issued", owner=uid, alias=alias, via="menu")
+            return self.tg.send(uid, f"Код для «{alias}»:\n\n/pair {code} {alias}\n\n"
+                                     "Отправьте эту строку боту — он привяжется.",
+                                [[("⬅️ Боты", "hub:menu:bots"), ("❌ Закрыть", "hub:menu:close")]])
+
+        if action == "new_route":
+            parts = value.split()
+            if len(parts) < 2:
+                return self.say(uid, "Нужно: <от> <кому> [ask|auto]. Пример: god aa ask")
+            src = "" if parts[0] in ("-", "вы", "me") else parts[0]
+            dst = parts[1]
+            pol = parts[2].lower() if len(parts) > 2 else "ask"
+            if pol not in ("ask", "auto"):
+                return self.say(uid, "Политика: ask или auto")
+            if not self.db.bot_by_alias(uid, dst):
+                return self.say(uid, f"Нет бота «{dst}». Сначала /pair.")
+            self.db.set_route(uid, src, dst, policy=pol)
+            self.db.clear_state(uid)
+            self.db.event("route_created", owner=uid, src=src, dst=dst, policy=pol, via="menu")
+            return self.say(uid, f"✅ Маршрут {src or 'вы'} → {dst}: {pol}\n"
+                                 "Дальше его можно править в /menu → Маршруты.")
+
+        self.db.clear_state(uid)
+        return self.say(uid, "Ввод сброшен.")
+
     def _show(self, uid: int, chat: Any, msg_id: Any, text: str, rows: list) -> bool:
         """Показать экран: правим сообщение, если можем, иначе шлём новое."""
         if msg_id:
@@ -803,7 +889,8 @@ class Hub:
                 f"skills: {', '.join(s['id'] for s in card['skills']) or '—'}\n"
                 f"bot_id: {bot['bot_id']}")
         self.db.event("menu_bot_card", owner=uid, alias=alias)
-        self._show(uid, chat, msg_id, text, back)
+        self._show(uid, chat, msg_id, text,
+                   [[("✏️ Изменить описание", f"hub:desc:{alias}")], *back])
 
     def send_route(self, uid: int, chat: Any, msg_id: Any, route_id: str) -> None:
         back = [[("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")]]
@@ -814,6 +901,7 @@ class Hub:
         policy = str(route["policy"])
         per_hour = int(route["per_hour"])
         next_limit = next((x for x in (5, 20, 50, 100) if x > per_hour), 5)
+        next_max = next((x for x in (1000, 2000, 3000, 4000) if x > int(route["max_text"])), 1000)
         text = (f"🔀 {route['src_alias'] or 'вы'} → {route['dst_alias']}\n\n"
                 f"политика: {policy} "
                 f"({'спрашивать владельца' if policy == 'ask' else 'продолжения без карточки'})\n"
@@ -822,6 +910,7 @@ class Hub:
         rows = [
             [(f"Политика → {'auto' if policy == 'ask' else 'ask'}", f"hub:rpol:{route['id']}")],
             [(f"Лимит → {next_limit}/час", f"hub:rlim:{route['id']}")],
+            [(f"max_text → {next_max}", f"hub:rmax:{route['id']}")],
             *back,
         ]
         self.db.event("menu_route", owner=uid, route=int(route["id"]))
@@ -834,14 +923,17 @@ class Hub:
             return self.send_route(uid, chat, msg_id, route_id)
         policy = str(route["policy"])
         per_hour = int(route["per_hour"])
+        max_text = int(route["max_text"])
         if kind == "rpol":
             policy = "auto" if policy == "ask" else "ask"
-        else:
+        elif kind == "rlim":
             per_hour = next((x for x in (5, 20, 50, 100) if x > per_hour), 5)
+        else:
+            max_text = next((x for x in (1000, 2000, 3000, 4000) if x > max_text), 1000)
         self.db.set_route(uid, str(route["src_alias"]), str(route["dst_alias"]),
-                          policy=policy, max_text=int(route["max_text"]), per_hour=per_hour)
+                          policy=policy, max_text=max_text, per_hour=per_hour)
         self.db.event("route_updated", owner=uid, route=int(route["id"]),
-                      policy=policy, per_hour=per_hour)
+                      policy=policy, per_hour=per_hour, max_text=max_text)
         self.send_route(uid, chat, msg_id, route_id)
 
     def send_task_card(self, uid: int, chat: Any, msg_id: Any, task_id: str) -> None:
@@ -901,6 +993,7 @@ class Hub:
                         if found else "Ботов нет. /pair <алиас>")
                 rows = [[(f"🪪 {r['alias']} · @{r['username']}", f"hub:card:{r['alias']}")]
                         for r in found] or []
+                rows.append([("➕ Добавить бота", "hub:new:pair")])
                 rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
             elif section == "routes":
                 found = self.db.routes(uid)
@@ -908,6 +1001,7 @@ class Hub:
                         else "Маршрутов нет. /route <от> <кому> ask|auto")
                 rows = [[(f"🔀 {r['src_alias'] or 'вы'} → {r['dst_alias']} · {r['policy']}",
                           f"hub:route:{r['id']}")] for r in found] or []
+                rows.append([("➕ Новый маршрут", "hub:new:route")])
                 rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
             elif section == "log":
                 found = self.db.q("SELECT * FROM tasks WHERE owner_tg=? ORDER BY created_at DESC "

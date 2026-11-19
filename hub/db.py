@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS links (
     created_at  REAL NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS links_pair ON links(src_bot_id, dst_bot_id);
+CREATE TABLE IF NOT EXISTS owner_state (
+    owner_tg    INTEGER PRIMARY KEY,
+    action      TEXT NOT NULL,
+    payload     TEXT,
+    created_at  REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          REAL NOT NULL,
@@ -301,6 +307,24 @@ class Db:
     def routes(self, owner: int) -> List[sqlite3.Row]:
         return self.q("SELECT * FROM routes WHERE owner_tg=? ORDER BY src_alias, dst_alias",
                       (owner,))
+
+    # ── состояние диалога (inline-кнопки не умеют вводить текст) ─────────────
+    def set_state(self, owner: int, action: str, payload: str = "") -> None:
+        self.conn.execute("INSERT INTO owner_state (owner_tg, action, payload, created_at) "
+                          "VALUES (?,?,?,?) ON CONFLICT(owner_tg) DO UPDATE SET "
+                          "action=excluded.action, payload=excluded.payload, "
+                          "created_at=excluded.created_at", (owner, action, payload, now()))
+
+    def get_state(self, owner: int, ttl_s: float = 600) -> Optional[sqlite3.Row]:
+        row = self.one("SELECT * FROM owner_state WHERE owner_tg=?", (owner,))
+        if row and float(row["created_at"]) + ttl_s < now():
+            self.clear_state(owner)
+            return None
+        return row
+
+    def clear_state(self, owner: int) -> None:
+        self.conn.execute("DELETE FROM owner_state WHERE owner_tg=?", (owner,))
+        self.conn.execute("DELETE FROM owner_state WHERE created_at < ?", (now() - 3600,))
 
     # ── tasks ────────────────────────────────────────────────────────────────
     def create_task(self, *, task_id: str, owner: int, direction: str, ctx: str, hops: int,

@@ -634,6 +634,53 @@ def run() -> dict:
     assert not any(b[1].startswith("hub:tcancel:") for r in after["buttons"] for b in r), after
     res["menu_task_details_and_cancel"] = True
 
+    # 10n. меню: добавление бота, описание с кнопки, новый маршрут, max_text
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+
+    hub.handle(cb(OWNER, "hub:menu:bots", message_id=11))
+    assert any(b[1] == "hub:new:pair" for r in tg.sent[-1]["buttons"] for b in r)
+    hub.handle(cb(OWNER, "hub:new:pair", message_id=11))
+    assert "алиас нового бота" in tg.sent[-1]["text"]
+    hub.handle(msg(OWNER, "bb"))
+    issued = tg.sent[-1]["text"]
+    assert "/pair HUB-" in issued, issued
+    code_line = [ln for ln in issued.splitlines() if ln.startswith("/pair ")][0]
+    hub.handle(msg(555000123, code_line, is_bot=True, username="bb_bot"))
+    assert hub.db.bot_by_alias(OWNER, "bb")["username"] == "bb_bot"
+    res["menu_add_bot"] = True
+
+    hub.handle(cb(OWNER, "hub:card:bb", message_id=11))
+    assert any(b[1] == "hub:desc:bb" for r in tg.sent[-1]["buttons"] for b in r)
+    hub.handle(cb(OWNER, "hub:desc:bb", message_id=11))
+    assert "Пришлите описание" in tg.sent[-1]["text"]
+    hub.handle(msg(OWNER, "смотрит логи и диск"))
+    assert "смотрит логи и диск" in tg.sent[-1]["text"]
+    assert (hub.db.bot_by_alias(OWNER, "bb")["description"] or "").startswith("смотрит")
+    res["menu_describe_input"] = True
+
+    hub.handle(cb(OWNER, "hub:menu:routes", message_id=11))
+    assert any(b[1] == "hub:new:route" for r in tg.sent[-1]["buttons"] for b in r)
+    hub.handle(cb(OWNER, "hub:new:route", message_id=11))
+    assert "маршрут одной строкой" in tg.sent[-1]["text"]
+    hub.handle(msg(OWNER, "god bb auto"))
+    assert hub.db.route(OWNER, "god", "bb")["policy"] == "auto"
+    res["menu_new_route"] = True
+
+    rid = hub.db.route(OWNER, "god", "bb")["id"]
+    hub.handle(cb(OWNER, f"hub:route:{rid}", message_id=11))
+    assert any(b[1] == f"hub:rmax:{rid}" for r in tg.sent[-1]["buttons"] for b in r)
+    hub.handle(cb(OWNER, f"hub:rmax:{rid}", message_id=11))
+    assert hub.db.route(OWNER, "god", "bb")["max_text"] == 4000
+    res["menu_max_text"] = True
+
+    # /cancel сбрасывает ожидание ввода
+    hub.handle(cb(OWNER, "hub:new:route", message_id=11))
+    hub.handle(msg(OWNER, "/cancel"))
+    assert "отменён" in tg.sent[-1]["text"]
+    assert hub.db.get_state(OWNER) is None
+    res["menu_cancel_input"] = True
+
     # старый самодельный конверт больше не принимается
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),
