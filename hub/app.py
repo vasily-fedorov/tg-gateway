@@ -963,7 +963,7 @@ class Hub:
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
                        "desc", "new", "newr", "rdel", "rdelok", "tfull", "a2apol", "rctx",
                        "cl", "cname", "cbot", "cpol", "cmax", "cph", "crot", "croty",
-                       "crev", "crevy"):
+                       "crev", "crevy", "cexp"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -992,6 +992,8 @@ class Hub:
                 return self.toggle_client_bot(uid, chat_id, msg_id, task_id)
             if verdict in ("cpol", "cmax", "cph"):
                 return self.cycle_client_setting(uid, chat_id, msg_id, task_id, verdict)
+            if verdict == "cexp":
+                return self.cycle_client_expiry(uid, chat_id, msg_id, task_id)
             if verdict == "crot":
                 return self.confirm_client_rotate(uid, chat_id, msg_id, task_id)
             if verdict == "croty":
@@ -1305,8 +1307,7 @@ class Hub:
         seen = row["last_seen_at"]
         seen_s = (time.strftime("%d.%m %H:%M", time.localtime(float(seen))) if seen else "не было")
         expires = row["expires_at"]
-        expires_s = (time.strftime("%d.%m %Y", time.localtime(float(expires)))
-                     if expires else "бессрочно")
+        expires_s = self._expiry_label(expires)
         state = "активен" if int(row["enabled"]) and not row["revoked_at"] else "отозван"
         text = (f"🔑 {row['name'] or client_id}  ({client_id})\n"
                 f"токен: {row['token_prefix']}      состояние: {state}\n"
@@ -1323,6 +1324,7 @@ class Hub:
                       f"hub:cmax:{client_id}"),
                      (f"час → {self._next_num(int(row['per_hour']), (50, 100, 200, 500))}",
                       f"hub:cph:{client_id}")])
+        rows.append([(f"📅 Срок → {self._next_expiry_label(expires)}", f"hub:cexp:{client_id}")])
         rows.append([("🔄 Ротация токена", f"hub:crot:{client_id}"),
                      ("⛔ Отозвать", f"hub:crev:{client_id}")])
         rows.extend(back)
@@ -1337,6 +1339,43 @@ class Hub:
     @staticmethod
     def _next_num(current: int, options: tuple) -> int:
         return next((x for x in options if x > current), options[0])
+
+    EXPIRY_PRESETS = (7, 30, 90)          # дни; None = бессрочно
+
+    @staticmethod
+    def _expiry_label(expires: Any) -> str:
+        if not expires:
+            return "бессрочно"
+        left = (float(expires) - time.time()) / 86400
+        stamp = time.strftime("%d.%m.%Y", time.localtime(float(expires)))
+        if left <= 0:
+            return f"истёк {stamp}"
+        return f"до {stamp} ({int(left)} дн)" if left >= 1 else f"до {stamp} (<1 дн)"
+
+    def _next_expiry_days(self, expires: Any) -> Optional[int]:
+        """Бессрочно → 7 → 30 → 90 → бессрочно."""
+        if not expires:
+            return self.EXPIRY_PRESETS[0]
+        left = (float(expires) - time.time()) / 86400
+        for days in self.EXPIRY_PRESETS:
+            if left < days:
+                nxt = [d for d in self.EXPIRY_PRESETS if d > days]
+                return nxt[0] if nxt else None
+        return None
+
+    def _next_expiry_label(self, expires: Any) -> str:
+        days = self._next_expiry_days(expires)
+        return f"{days} дн" if days else "бессрочно"
+
+    def cycle_client_expiry(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
+        row = self.db.client(uid, client_id)
+        if not row:
+            return self.send_menu_section(uid, None, msg_id, "clients")
+        days = self._next_expiry_days(row["expires_at"])
+        expires_at = time.time() + days * 86400 if days else None
+        self.db.update_client(client_id, expires_at=expires_at)
+        self.db.event("client_expiry_changed", owner=uid, client=client_id, days=days)
+        self.send_client_card(uid, None, msg_id, client_id)
 
     def begin_client_rename(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
         if not self.db.client(uid, client_id):

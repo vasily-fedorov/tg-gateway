@@ -1127,6 +1127,51 @@ def run() -> dict:
         assert hub.db.q("SELECT 1 FROM events WHERE kind='client_denied' AND detail LIKE '%revoked%'")
     finally:
         server.shutdown()
+    # 10w. срок действия клиента из меню: 7 → 30 → 90 → бессрочно, истёкший → 401
+    import time as _t
+    from hub import a2a_http as _a2a_http
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    row, token = hub.db.create_client(owner=OWNER, name="expiring", bots="*")
+    cid = row["client_id"]
+
+    hub.handle(cb(OWNER, f"hub:cexp:{cid}", message_id=70))
+    exp = hub.db.client(OWNER, cid)["expires_at"]
+    assert exp and 6.9 * 86400 < (exp - _t.time()) < 7.1 * 86400, exp
+    card = [x for x in tg.sent if x["text"].startswith("🔑 expiring")][-1]["text"]
+    assert "до " in card and "7 дн" in card or "6 дн" in card, card
+
+    hub.handle(cb(OWNER, f"hub:cexp:{cid}", message_id=70))
+    exp30 = hub.db.client(OWNER, cid)["expires_at"]
+    assert 29.9 * 86400 < (exp30 - _t.time()) < 30.1 * 86400, exp30
+    hub.handle(cb(OWNER, f"hub:cexp:{cid}", message_id=70))
+    exp90 = hub.db.client(OWNER, cid)["expires_at"]
+    assert 89.9 * 86400 < (exp90 - _t.time()) < 90.1 * 86400, exp90
+    hub.handle(cb(OWNER, f"hub:cexp:{cid}", message_id=70))
+    assert hub.db.client(OWNER, cid)["expires_at"] is None
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='client_expiry_changed' LIMIT 1")
+
+    # истёкший клиент не проходит авторизацию
+    hub.db.update_client(cid, expires_at=_t.time() - 60)
+    server = _a2a_http.start(hub, port=0, token="legacy-exp")
+    try:
+        import urllib.error
+        import urllib.request
+        port = server.server_address[1]
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/bot/aa/", method="POST",
+                                     data=b'{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"x"}}',
+                                     headers={"Authorization": f"Bearer {token}",
+                                              "Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            raise AssertionError("истёкший клиент должен получать 401")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, exc.code
+        assert hub.db.q("SELECT 1 FROM events WHERE kind='client_denied' AND detail LIKE '%expired%'")
+    finally:
+        server.shutdown()
+    res["client_expiry_menu"] = True
+
     res["clients_tokens_limits"] = True
 
     # старый самодельный конверт больше не принимается
