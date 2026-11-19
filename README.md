@@ -76,14 +76,22 @@ A2A client ──HTTP/JSON-RPC──▶ hub :18765 ──карточка──�
 TG_GATEWAY_A2A_PORT=18765          # 0 = выключено
 TG_GATEWAY_A2A_HOST=127.0.0.1      # наружу — только через nginx + TLS
 TG_GATEWAY_A2A_TOKEN=<bearer>      # без него фронт отвечает 401
+TG_GATEWAY_A2A_WAIT=25             # сколько ждать клика владельца внутри message/send
+TG_GATEWAY_A2A_PUBLIC_URL=https://a2a.example.com   # что писать в карточке (за nginx)
 ```
 
 Что поддерживается:
 
 - `GET /.well-known/agent-card.json` (и алиас `agent.json`) — карточка хаба, боты = skills;
+- `GET /bot/<alias>/.well-known/agent-card.json` — карточка конкретного бота: у неё
+  `supportedInterfaces[].url = <public>/bot/<alias>`, поэтому клиент, знающий только URL,
+  сразу попадает в нужного бота (клиент Hermes не умеет передавать `params.to`);
 - `POST /` JSON-RPC: `message/send`, `tasks/get`, `tasks/list`, `tasks/cancel`,
   `agent/card`, `agent/protocol`;
 - `GET /health`.
+
+Методы принимаются и в v1.0-написании: `SendMessage`, `GetTask`, `CancelTask`,
+`ListTasks` (клиент Hermes шлёт именно `SendMessage`).
 
 Честные ограничения: `message/send` **всегда асинхронный** — владелец подтверждает
 карточку, поэтому клиент получает Task в состоянии `auth-required` и дальше поллит
