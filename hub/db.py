@@ -304,6 +304,10 @@ class Db:
             "max_text=excluded.max_text, per_hour=excluded.per_hour",
             (owner, src, dst, policy, max_text, per_hour, now()))
 
+    def delete_route(self, owner: int, route_id: int) -> bool:
+        cur = self.conn.execute("DELETE FROM routes WHERE id=? AND owner_tg=?", (route_id, owner))
+        return bool(cur.rowcount)
+
     def routes(self, owner: int) -> List[sqlite3.Row]:
         return self.q("SELECT * FROM routes WHERE owner_tg=? ORDER BY src_alias, dst_alias",
                       (owner,))

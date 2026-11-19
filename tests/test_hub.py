@@ -697,6 +697,30 @@ def run() -> dict:
     assert hub.db.get_state(OWNER) is None
     res["menu_cancel_input"] = True
 
+    # 10o. удаление маршрута: подтверждение и отмена
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.db.set_route(OWNER, "god", "aa", policy="ask")
+    rid = hub.db.route(OWNER, "god", "aa")["id"]
+
+    hub.handle(cb(OWNER, f"hub:route:{rid}", message_id=13))
+    assert any(b[1] == f"hub:rdel:{rid}" for r in tg.sent[-1]["buttons"] for b in r)
+    hub.handle(cb(OWNER, f"hub:rdel:{rid}", message_id=13))
+    confirm = tg.sent[-1]
+    assert "Удалить маршрут" in confirm["text"] and "Задачи и история останутся" in confirm["text"]
+    assert any(b[1] == f"hub:rdelok:{rid}" for r in confirm["buttons"] for b in r)
+
+    hub.handle(cb(OWNER, f"hub:route:{rid}", message_id=13))      # отмена
+    assert hub.db.route(OWNER, "god", "aa") is not None
+
+    hub.handle(cb(OWNER, f"hub:rdel:{rid}", message_id=13))
+    hub.handle(cb(OWNER, f"hub:rdelok:{rid}", message_id=13))
+    assert hub.db.route(OWNER, "god", "aa") is None
+    assert "удалён" in tg.sent[-1]["text"], tg.sent[-1]["text"]
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='route_deleted'")
+    res["menu_route_delete"] = True
+
     # старый самодельный конверт больше не принимается
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),

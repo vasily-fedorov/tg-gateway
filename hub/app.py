@@ -721,7 +721,7 @@ class Hub:
             self.tg.answer_callback(cb_id, "")
             return self.send_menu_section(uid, chat_id, msg_id, task_id)
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
-                       "desc", "new", "newr"):
+                       "desc", "new", "newr", "rdel", "rdelok"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -736,6 +736,10 @@ class Hub:
             if verdict == "newr":
                 step, _, value = task_id.partition(":")
                 return self.route_wizard(uid, chat_id, msg_id, step, value)
+            if verdict == "rdel":
+                return self.confirm_route_delete(uid, chat_id, msg_id, task_id)
+            if verdict == "rdelok":
+                return self.do_route_delete(uid, chat_id, msg_id, task_id)
             if verdict == "task":
                 return self.send_task_card(uid, chat_id, msg_id, task_id)
             if verdict == "tcancel":
@@ -969,6 +973,7 @@ class Hub:
             [(f"Политика → {'auto' if policy == 'ask' else 'ask'}", f"hub:rpol:{route['id']}")],
             [(f"Лимит → {next_limit}/час", f"hub:rlim:{route['id']}")],
             [(f"max_text → {next_max}", f"hub:rmax:{route['id']}")],
+            [("🗑 Удалить маршрут", f"hub:rdel:{route['id']}")],
             *back,
         ]
         self.db.event("menu_route", owner=uid, route=int(route["id"]))
@@ -993,6 +998,30 @@ class Hub:
         self.db.event("route_updated", owner=uid, route=int(route["id"]),
                       policy=policy, per_hour=per_hour, max_text=max_text)
         self.send_route(uid, chat, msg_id, route_id)
+
+    def confirm_route_delete(self, uid: int, chat: Any, msg_id: Any, route_id: str) -> None:
+        route = (self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
+                             (int(route_id), uid)) if str(route_id).isdigit() else None)
+        if not route:
+            return self.send_menu_section(uid, chat, msg_id, "routes")
+        text = (f"🗑 Удалить маршрут {route['src_alias'] or 'вы'} → {route['dst_alias']}?\n\n"
+                "Задачи и история останутся, но новые отправки по этому маршруту станут "
+                "невозможны (нужен будет новый).")
+        rows = [[("✅ Да, удалить", f"hub:rdelok:{route['id']}")],
+                [("⬅️ Отмена", f"hub:route:{route['id']}"), ("❌ Закрыть", "hub:menu:close")]]
+        self._show(uid, chat, msg_id, text, rows)
+
+    def do_route_delete(self, uid: int, chat: Any, msg_id: Any, route_id: str) -> None:
+        route = (self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
+                             (int(route_id), uid)) if str(route_id).isdigit() else None)
+        if not route:
+            return self.send_menu_section(uid, chat, msg_id, "routes")
+        src, dst = str(route["src_alias"]), str(route["dst_alias"])
+        self.db.delete_route(uid, int(route["id"]))
+        self.db.event("route_deleted", owner=uid, route=int(route["id"]), src=src, dst=dst,
+                      via="menu")
+        self._show(uid, chat, msg_id, f"🗑 Маршрут {src or 'вы'} → {dst} удалён.",
+                   [[("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")]])
 
     def send_task_card(self, uid: int, chat: Any, msg_id: Any, task_id: str) -> None:
         back = [[("⬅️ Задачи", "hub:menu:log"), ("❌ Закрыть", "hub:menu:close")]]
