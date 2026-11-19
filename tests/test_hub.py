@@ -1206,13 +1206,37 @@ def run() -> dict:
 
         os.environ["TG_GATEWAY_A2A_PUBLIC_CARD"] = "1"
         public = card_get({})
-        assert {a["alias"] for a in public["metadata"]["agents"]} == {"aa", "god"}
-        # бот-карточка тоже открыта, но POST по-прежнему требует токен
+        # аноним не видит ни одного бота — только факт наличия шлюза
+        assert public["metadata"]["agents"] == [], public["metadata"]
+        assert public["skills"] == [] and public["metadata"]["discovery"] == "auth-required"
+        assert "god" not in json.dumps(public, ensure_ascii=False)
+        # бот-карточка анониму закрыта
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(
+                    f"http://127.0.0.1:{port}/bot/aa/.well-known/agent-card.json"), timeout=5)
+            raise AssertionError("карточка бота анониму недоступна")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404, exc.code
+
+        # с токеном клиента видно только его ботов
+        row, token = hub.db.create_client(owner=OWNER, name="scoped", bots='["aa"]')
+        scoped = card_get({"Authorization": f"Bearer {token}"})
+        assert {a["alias"] for a in scoped["metadata"]["agents"]} == {"aa"}, scoped
         req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/bot/aa/.well-known/agent-card.json")
+            f"http://127.0.0.1:{port}/bot/aa/.well-known/agent-card.json",
+            headers={"Authorization": f"Bearer {token}"})
         with urllib.request.urlopen(req, timeout=5) as r:
             bot_card = json.load(r)
         assert bot_card["supportedInterfaces"][0]["url"].endswith("/bot/aa")
+        # чужой бот виден как 404
+        try:
+            urllib.request.urlopen(urllib.request.Request(
+                f"http://127.0.0.1:{port}/bot/god/.well-known/agent-card.json",
+                headers={"Authorization": f"Bearer {token}"}), timeout=5)
+            raise AssertionError("чужой бот должен быть 404")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404, exc.code
         post = urllib.request.Request(
             f"http://127.0.0.1:{port}/bot/aa/", method="POST",
             data=b'{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"x"}}',

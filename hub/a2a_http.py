@@ -120,6 +120,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = self._normalized_path()
         alias = self._alias()
+        kind, client = self._resolve_client()
         if path not in ("/.well-known/agent-card.json", "/.well-known/agent.json",
                         "/health", "/card"):
             return self._send(404, {"error": "not found"})
@@ -128,17 +129,30 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/health":
             return self._send(200, {"ok": True})
         owner = self._owner()
+        allowed = client.get("bots_set") if kind == "client" else None
+        anon = kind is None                      # публичная карточка без токена
         if alias:
+            if anon:
+                return self._send(404, {"error": "agent card requires auth"})
             bot = self.hub.db.bot_by_alias(owner, alias) if owner else None
-            if not bot:
+            if not bot or (allowed is not None and alias not in allowed):
                 return self._send(404, {"error": f"бот «{alias}» не найден"})
             url = f"{self.hub._a2a_public_url()}/bot/{alias}"
             card = rpc.bot_card(bot, owner)
             card["supportedInterfaces"] = [{"protocolBinding": "JSONRPC", "url": url}]
             card["url"] = url
         else:
-            card = (rpc.hub_card(owner, self.hub.db.bots(owner),
+            bots = self.hub.db.bots(owner) if owner else []
+            if anon:
+                bots = []                       # без токена список агентов не раскрываем
+            elif allowed is not None:
+                bots = [b for b in bots if str(b["alias"]) in allowed]
+            card = (rpc.hub_card(owner, bots,
                                  public_url=self.hub._a2a_public_url()) if owner else {})
+            if anon:
+                card["metadata"]["discovery"] = "auth-required"
+                card["description"] = ("A2A-шлюз. Список агентов доступен после "
+                                       "авторизации (Bearer).")
         card["metadata"] = {**card.get("metadata", {}), "transport": "http-a2a-proxy",
                             "upstream": "telegram", "bot": alias}
         return self._send(200, card)
