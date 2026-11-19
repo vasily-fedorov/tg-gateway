@@ -90,6 +90,10 @@ TG_GATEWAY_A2A_PUBLIC_URL=https://a2a.example.com   # что писать в к�
   `agent/card`, `agent/protocol`;
 - `GET /health`.
 
+Ветка (`contextId`) поддержана как в спеке: `GetTask(historyLength)`, `ListTasks(contextId)`,
+плюс хаб сам передаёт боту выжимку предыдущих ходов ветки (`data.context`, 5 ходов × 240 символов,
+отключается тумблером «🧠 Контекст» на маршруте).
+
 Методы принимаются и в v1.0-написании: `SendMessage`, `GetTask`, `CancelTask`,
 `ListTasks` (клиент Hermes шлёт именно `SendMessage`).
 

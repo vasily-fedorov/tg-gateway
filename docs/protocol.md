@@ -169,7 +169,22 @@ auth-required ──клик владельца──▶ working ──▶ compl
   задачу боту, а закрывает задачу клиента (artifact в `tasks/get`);
 - ограничения: `streaming=false`, `pushNotifications=false`, один токен = один владелец.
 
-## 9. Аудит
+## 9. Контекст ветки (contextId)
+
+`contextId` — не общая память, а ветка: хаб помнит задачи с этим `ctx` и передаёт
+получателю сжатую выжимку предыдущих ходов.
+
+- `GetTask` понимает `historyLength` (0 — без истории, N — последние N сообщений, не задано — все);
+- `ListTasks` фильтрует по `contextId` (и `status`);
+- при доставке боту в `message/parts` добавляется `{kind: "data", data: {context: [{from,to,
+  question,answer,state}, ...]}}` — до 5 ходов, 240 символов на поле; в `metadata.contextTurns`
+  число переданных ходов;
+- выключается на маршруте (`context_mode='off'`, в меню — «🧠 Контекст → выкл»); для задач
+  внешних клиентов берётся маршрут `'' → <bot>`;
+- выжимка собирается только по своей ветке и только для получателя: агенты по-прежнему не
+  видят чужие задачи и не имеют общего хранилища.
+
+## 10. Аудит
 
 Хаб: таблица `events` (`relay_parked`, `card_approved`, `delivered`, `reply_parked`,
 `task_skipped`, `ttl_rejected`, `rpc_dedup`, `rpc_dedup_fingerprint`, `hop_limit`,
