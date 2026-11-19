@@ -744,6 +744,16 @@ class Hub:
         self.db.create_task(task_id=task_id, owner=owner, direction="a2a", ctx=ctx, hops=1,
                             src="a2a-client", dst=to_alias, text=text, status="submitted",
                             attachments=json.dumps(attachments, ensure_ascii=False))
+        # Политика хаба: спрашивать владельца или доставлять сразу.
+        mode = (str(target["a2a_policy"] or "").strip()
+                or (os.environ.get("TG_GATEWAY_A2A_POLICY") or "ask").strip()).lower()
+        mode = mode if mode in ("ask", "auto") else "ask"
+        if mode == "auto":
+            ok = self.deliver(task_id)
+            self.db.event("a2a_auto_delivered", task_id=task_id, owner=owner,
+                          dst=to_alias, ok=bool(ok), length=len(text))
+            task = self.db.task(task_id)
+            return {"task": rpc.task_view(task)}, 0
         preview = text.replace("\n", " ")[:300] or "(без текста)"
         ok, res = self.tg.send(owner, f"🌐 Внешний A2A-клиент → «{to_alias}»?\n\n{preview}\n\n"
                                       f"· задача {task_id} · ctx {ctx}",
@@ -756,7 +766,7 @@ class Hub:
                        or (params.get("metadata") or {}).get("wait_seconds")
                        or os.environ.get("TG_GATEWAY_A2A_WAIT") or 0)
         wait_s = max(0.0, min(wait_s, 100.0))
-        if wait_s:
+        if wait_s and mode != "auto":
             deadline = time.time() + wait_s
             while time.time() < deadline:
                 task = self.db.task(task_id)
@@ -854,7 +864,7 @@ class Hub:
             self.tg.answer_callback(cb_id, "")
             return self.send_menu_section(uid, chat_id, msg_id, task_id)
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
-                       "desc", "new", "newr", "rdel", "rdelok", "tfull"):
+                       "desc", "new", "newr", "rdel", "rdelok", "tfull", "a2apol"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -875,6 +885,8 @@ class Hub:
                 return self.do_route_delete(uid, chat_id, msg_id, task_id)
             if verdict == "tfull":
                 return self.send_task_full(uid, chat_id, task_id)
+            if verdict == "a2apol":
+                return self.toggle_a2a_policy(uid, chat_id, msg_id, task_id)
             if verdict == "task":
                 return self.send_task_card(uid, chat_id, msg_id, task_id)
             if verdict == "tcancel":
@@ -1084,10 +1096,28 @@ class Hub:
                 f"capabilities: streaming={caps['streaming']}, "
                 f"push={caps['pushNotifications']}, humanApproval={caps['humanApproval']}\n"
                 f"skills: {', '.join(s['id'] for s in card['skills']) or '—'}\n"
-                f"bot_id: {bot['bot_id']}")
+                f"bot_id: {bot['bot_id']}\n"
+                f"A2A: {self._a2a_mode(bot)} "
+                f"({'карточка владельцу' if self._a2a_mode(bot) == 'ask' else 'доставка сразу'})")
         self.db.event("menu_bot_card", owner=uid, alias=alias)
         self._show(uid, chat, msg_id, text,
-                   [[("✏️ Изменить описание", f"hub:desc:{alias}")], *back])
+                   [[("✏️ Изменить описание", f"hub:desc:{alias}")],
+                    [(f"🌐 A2A → {'авто' if self._a2a_mode(bot) == 'ask' else 'спрашивать'}",
+                      f"hub:a2apol:{alias}")], *back])
+
+    def _a2a_mode(self, bot: Any) -> str:
+        mode = (str(bot["a2a_policy"] or "").strip()
+                or (os.environ.get("TG_GATEWAY_A2A_POLICY") or "ask").strip()).lower()
+        return mode if mode in ("ask", "auto") else "ask"
+
+    def toggle_a2a_policy(self, uid: int, chat: Any, msg_id: Any, alias: str) -> None:
+        bot = self.db.bot_by_alias(uid, alias)
+        if not bot:
+            return self.send_bot_card(uid, chat, msg_id, alias)
+        new_mode = "auto" if self._a2a_mode(bot) == "ask" else "ask"
+        self.db.set_a2a_policy(uid, alias, new_mode)
+        self.db.event("a2a_policy_changed", owner=uid, alias=alias, mode=new_mode)
+        self.send_bot_card(uid, chat, msg_id, alias)
 
     def send_route(self, uid: int, chat: Any, msg_id: Any, route_id: str) -> None:
         back = [[("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")]]

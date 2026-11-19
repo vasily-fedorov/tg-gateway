@@ -6,6 +6,7 @@ Run: python3 tests/test_hub.py
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -911,6 +912,42 @@ def run() -> dict:
     finally:
         server.shutdown()
     res["a2a_path_routing"] = True
+
+    # 10t. политика A2A из конфига хаба: ask (карточка) / auto (доставка сразу)
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub._a2a_public_url = lambda: "http://127.0.0.1:18765"
+
+    # по умолчанию — ask: карточка владельцу, состояние auth-required
+    out, _ = hub.http_rpc("SendMessage", {"to": "aa",
+                                          "message": {"parts": [{"kind": "text", "text": "раз"}]}})
+    assert out["task"]["status"]["state"] == "auth-required", out
+    assert any(x["chat"] == OWNER and x["buttons"] for x in tg.sent)
+
+    # переключаем в auto через меню и повторяем
+    hub.handle(cb(OWNER, "hub:a2apol:aa", message_id=40))
+    assert hub.db.bot_by_alias(OWNER, "aa")["a2a_policy"] == "auto"
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='a2a_policy_changed'")
+    cards_before = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
+    out, _ = hub.http_rpc("SendMessage", {"to": "aa",
+                                          "message": {"parts": [{"kind": "text", "text": "два"}]}})
+    assert out["task"]["status"]["state"] in ("working", "completed"), out
+    assert len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]]) == cards_before
+    delivered = [x for x in tg.sent if x["chat"] == AA and x["text"].startswith("{")]
+    assert delivered and json.loads(delivered[-1]["text"])["method"] == "message/send"
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='a2a_auto_delivered'")
+
+    # env-значение работает как значение по умолчанию для ботов без своей политики
+    hub.db.set_a2a_policy(OWNER, "aa", "")
+    hub.db.run("UPDATE bots SET a2a_policy='' WHERE alias='aa'")
+    os.environ["TG_GATEWAY_A2A_POLICY"] = "auto"
+    try:
+        out, _ = hub.http_rpc("SendMessage", {"to": "aa",
+                                              "message": {"parts": [{"kind": "text", "text": "три"}]}})
+        assert out["task"]["status"]["state"] in ("working", "completed"), out
+    finally:
+        os.environ.pop("TG_GATEWAY_A2A_POLICY", None)
+    res["a2a_policy_from_config"] = True
 
     # старый самодельный конверт больше не принимается
     hub, tg = new_hub()
