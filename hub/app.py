@@ -176,19 +176,7 @@ class Hub:
             task = self.db.task(parts[1].strip())
             if not task or int(task["owner_tg"]) != uid:
                 return self.say(uid, "Задача не найдена.")
-            view = rpc.task_view(task)
-            events = self.db.q("SELECT kind, ts FROM events WHERE task_id=? ORDER BY id",
-                               (task["task_id"],))
-            body = [f"задача {task['task_id']}  {task['src_alias']}→{task['dst_alias']}  "
-                    f"hops {task['hops']}  ctx {task['ctx']}",
-                    f"состояние: {view['status']['state']} ({task['status']})",
-                    f"текст: {(task['text'] or '')[:300]}"]
-            if task["question"]:
-                body.append(f"вопрос: {task['question'][:300]}")
-            if task["answer"]:
-                body.append(f"ответ: {task['answer'][:300]}")
-            body.append("события: " + ", ".join(f"{e['kind']}" for e in events[-8:]))
-            return self.say(uid, "\n".join(body))
+            return self.say(uid, self._task_text(task, body_limit=3000))
         if low.startswith("/describe"):
             parts = text.split(maxsplit=2)
             if len(parts) == 1:
@@ -721,7 +709,7 @@ class Hub:
             self.tg.answer_callback(cb_id, "")
             return self.send_menu_section(uid, chat_id, msg_id, task_id)
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
-                       "desc", "new", "newr", "rdel", "rdelok"):
+                       "desc", "new", "newr", "rdel", "rdelok", "tfull"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -740,6 +728,8 @@ class Hub:
                 return self.confirm_route_delete(uid, chat_id, msg_id, task_id)
             if verdict == "rdelok":
                 return self.do_route_delete(uid, chat_id, msg_id, task_id)
+            if verdict == "tfull":
+                return self.send_task_full(uid, chat_id, task_id)
             if verdict == "task":
                 return self.send_task_card(uid, chat_id, msg_id, task_id)
             if verdict == "tcancel":
@@ -1023,28 +1013,67 @@ class Hub:
         self._show(uid, chat, msg_id, f"🗑 Маршрут {src or 'вы'} → {dst} удалён.",
                    [[("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")]])
 
+    def _task_text(self, task: Any, *, body_limit: int = 1200) -> str:
+        """Человеческий вид задачи: суть, вложения, вопрос/ответ, события."""
+        view = rpc.task_view(task)
+        created = time.strftime("%d.%m %H:%M", time.localtime(float(task["created_at"])))
+        lines = [f"🗂 {task['task_id']}   {task['src_alias']} → {task['dst_alias']}",
+                 f"состояние: {view['status']['state']} ({task['status']}) · "
+                 f"hops {task['hops']} · ctx {task['ctx']} · создана {created}"]
+        body = (task["text"] or "").strip()
+        lines += ["", "📄 Задача:", body[:body_limit] if body else "— пусто —"]
+        if len(body) > body_limit:
+            lines.append(f"… ещё {len(body) - body_limit} симв. — кнопка «Полный текст»")
+        try:
+            attachments = json.loads(task["attachments"] or "[]")
+        except ValueError:
+            attachments = []
+        if attachments:
+            lines += ["", "📎 Вложения:"]
+            for item in attachments[:5]:
+                if item.get("kind") == "data":
+                    lines.append("• data: " + json.dumps(item.get("data"),
+                                                         ensure_ascii=False)[:300])
+                elif item.get("kind") == "file":
+                    info = item.get("file") or {}
+                    lines.append(f"• файл: {info.get('name', '?')} "
+                                 f"({info.get('mimeType', '?')}) {info.get('uri', '')}")
+        if task["question"]:
+            lines += ["", "❓ Вопрос:", str(task["question"])[:600]]
+        if task["answer"]:
+            lines += ["", "💬 Ответ:", str(task["answer"])[:600]]
+        events = self.db.q("SELECT kind FROM events WHERE task_id=? ORDER BY id",
+                           (task["task_id"],))
+        if events:
+            lines += ["", "события: " + ", ".join(e["kind"] for e in events[-10:])]
+        return "\n".join(lines)
+
     def send_task_card(self, uid: int, chat: Any, msg_id: Any, task_id: str) -> None:
         back = [[("⬅️ Задачи", "hub:menu:log"), ("❌ Закрыть", "hub:menu:close")]]
         task = self.db.task(task_id)
         if not task or int(task["owner_tg"]) != uid:
             return self._show(uid, chat, msg_id, "Задача не найдена.", back)
-        view = rpc.task_view(task)
-        lines = [f"🗂 {task_id}   {task['src_alias']}→{task['dst_alias']}",
-                 f"состояние: {view['status']['state']} ({task['status']}) · hops {task['hops']}"
-                 f" · ctx {task['ctx']}",
-                 f"текст: {(task['text'] or '')[:400]}"]
-        if task["question"]:
-            lines.append(f"вопрос: {task['question'][:300]}")
-        if task["answer"]:
-            lines.append(f"ответ: {task['answer'][:300]}")
-        events = self.db.q("SELECT kind FROM events WHERE task_id=? ORDER BY id", (task_id,))
-        lines.append("события: " + ", ".join(e["kind"] for e in events[-8:]))
         rows = []
+        if (task["text"] or "").strip():
+            rows.append([("📄 Полный текст", f"hub:tfull:{task_id}")])
         if task["status"] not in TERMINAL:
             rows.append([("❌ Отменить задачу", f"hub:tcancel:{task_id}")])
         rows.extend(back)
         self.db.event("menu_task", owner=uid, task=task_id)
-        self._show(uid, chat, msg_id, "\n".join(lines), rows)
+        self._show(uid, chat, msg_id, self._task_text(task), rows)
+
+    def send_task_full(self, uid: int, chat: Any, task_id: str) -> None:
+        """Полный текст задачи отдельными сообщениями (лимит Telegram 4096)."""
+        task = self.db.task(task_id)
+        if not task or int(task["owner_tg"]) != uid:
+            return self.say(chat or uid, "Задача не найдена.")
+        body = (task["text"] or "").strip() or "— пусто —"
+        head = f"📄 {task_id} · {task['src_alias']} → {task['dst_alias']} · полный текст"
+        chunks = [body[i:i + 3400] for i in range(0, len(body), 3400)] or [""]
+        for index, chunk in enumerate(chunks):
+            prefix = head + "\n\n" if index == 0 else "…\n"
+            self.say(chat or uid, prefix + chunk)
+        self.db.event("menu_task_full", owner=uid, task=task_id, length=len(body))
 
     def cancel_from_menu(self, uid: int, chat: Any, msg_id: Any, task_id: str) -> None:
         task = self.db.task(task_id)

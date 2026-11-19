@@ -721,6 +721,32 @@ def run() -> dict:
     assert hub.db.q("SELECT 1 FROM events WHERE kind='route_deleted'")
     res["menu_route_delete"] = True
 
+    # 10p. карточка задачи показывает суть, вложения и полный текст
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    long_text = "Сколько свободно на диске? " + ("подробности " * 200)
+    hub.db.create_task(task_id="card1", owner=OWNER, direction="relay", ctx="ctxc", hops=1,
+                       src="god", dst="aa", text=long_text, status="working",
+                       attachments=json.dumps([{"kind": "data", "data": {"free_gb": 31}},
+                                               {"kind": "file", "file": {"name": "df.txt",
+                                                                         "uri": "s3://r/df.txt",
+                                                                         "mimeType": "text/plain"}}],
+                                              ensure_ascii=False))
+    hub.handle(cb(OWNER, "hub:task:card1", message_id=17))
+    card = tg.sent[-1]["text"]
+    assert "📄 Задача:" in card and "Сколько свободно на диске?" in card, card
+    assert "📎 Вложения:" in card and "free_gb" in card and "df.txt" in card, card
+    assert "ещё" in card and "симв." in card, card
+    flat = [b[1] for r in tg.sent[-1]["buttons"] for b in r]
+    assert "hub:tfull:card1" in flat and "hub:tcancel:card1" in flat, flat
+
+    hub.handle(cb(OWNER, "hub:tfull:card1", message_id=17))
+    full = [x["text"] for x in tg.sent if x["text"].startswith("📄 card1")]
+    assert full and long_text[-40:].strip() in "\n".join(full), "полный текст не пришёл"
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='menu_task_full'")
+    res["menu_task_body_and_full"] = True
+
     # старый самодельный конверт больше не принимается
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),
