@@ -1170,6 +1170,63 @@ def run() -> dict:
         assert hub.db.q("SELECT 1 FROM events WHERE kind='client_denied' AND detail LIKE '%expired%'")
     finally:
         server.shutdown()
+    # 10x. discovery: адреса ботов в карточке + публичная карточка без токена
+    import urllib.error
+    import urllib.request
+    from hub import a2a_http as _a2a
+
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    pair(hub, tg, bot_id=GOD, alias="god")
+    hub._a2a_public_url = lambda: "https://a2a.example.com"
+    card, _ = hub.http_rpc("agent/card", {})
+    agents = card["card"]["metadata"]["agents"]
+    assert {a["alias"] for a in agents} == {"aa", "god"}, agents
+    aa = next(a for a in agents if a["alias"] == "aa")
+    assert aa["url"] == "https://a2a.example.com/bot/aa"
+    assert aa["card"].endswith("/bot/aa/.well-known/agent-card.json")
+    assert next(s for s in card["card"]["skills"] if s["id"] == "aa")["url"].endswith("/bot/aa")
+
+    os.environ.pop("TG_GATEWAY_A2A_PUBLIC_CARD", None)
+    server = _a2a.start(hub, port=0, token="tok")
+    try:
+        port = server.server_address[1]
+
+        def card_get(headers):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/.well-known/agent-card.json", headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.load(r)
+
+        try:
+            card_get({})
+            raise AssertionError("без токена карточка должна быть закрыта")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, exc.code
+
+        os.environ["TG_GATEWAY_A2A_PUBLIC_CARD"] = "1"
+        public = card_get({})
+        assert {a["alias"] for a in public["metadata"]["agents"]} == {"aa", "god"}
+        # бот-карточка тоже открыта, но POST по-прежнему требует токен
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/bot/aa/.well-known/agent-card.json")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            bot_card = json.load(r)
+        assert bot_card["supportedInterfaces"][0]["url"].endswith("/bot/aa")
+        post = urllib.request.Request(
+            f"http://127.0.0.1:{port}/bot/aa/", method="POST",
+            data=b'{"jsonrpc":"2.0","id":1,"method":"GetTask","params":{"id":"x"}}',
+            headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(post, timeout=5)
+            raise AssertionError("POST без токена должен быть 401")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, exc.code
+        os.environ.pop("TG_GATEWAY_A2A_PUBLIC_CARD", None)
+    finally:
+        server.shutdown()
+    res["a2a_discovery_public_card"] = True
+
     res["client_expiry_menu"] = True
 
     res["clients_tokens_limits"] = True

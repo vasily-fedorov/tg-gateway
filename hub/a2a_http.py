@@ -16,6 +16,7 @@ HTTP/JSON-RPC в те же операции хаба:
 from __future__ import annotations
 
 import json
+import os
 import secrets as _secrets
 import threading
 import time
@@ -73,6 +74,14 @@ class _Handler(BaseHTTPRequestHandler):
             return (None, None)
         return ("client", client)
 
+    CARD_PATHS = ("/.well-known/agent-card.json", "/.well-known/agent.json", "/card")
+
+    @staticmethod
+    def _card_public() -> bool:
+        """Discovery без токена: карточка агента — публичный документ."""
+        return str(os.environ.get("TG_GATEWAY_A2A_PUBLIC_CARD") or "").strip().lower() in (
+            "1", "true", "yes", "on")
+
     def _auth_ok(self) -> bool:
         kind, _ = self._resolve_client()
         return kind is not None
@@ -114,7 +123,7 @@ class _Handler(BaseHTTPRequestHandler):
         if path not in ("/.well-known/agent-card.json", "/.well-known/agent.json",
                         "/health", "/card"):
             return self._send(404, {"error": "not found"})
-        if not self._auth_ok():
+        if not self._auth_ok() and not (self._card_public() and path in self.CARD_PATHS):
             return self._send(401, {"error": "unauthorized"})
         if path == "/health":
             return self._send(200, {"ok": True})

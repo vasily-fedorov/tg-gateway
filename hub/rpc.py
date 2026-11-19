@@ -107,15 +107,21 @@ def bot_card(bot: Any, owner: Optional[int] = None) -> Dict[str, Any]:
 
 
 def hub_card(owner: int, bots: list, *, public_url: str = "") -> Dict[str, Any]:
-    skills = []
+    skills, agents = [], []
     for b in bots:
         b = dict(b)
+        desc = (b.get("description") or "").strip() or f"@{b['username']}"
+        bot_url = f"{public_url}/bot/{b['alias']}" if public_url else ""
         skills.append({
             "id": b["alias"],
             "name": b["alias"],
-            "description": (b.get("description") or "").strip() or f"@{b['username']}",
+            "description": desc,
             "tags": ["telegram", "hermes"],
+            "url": bot_url,
         })
+        agents.append({"alias": b["alias"], "name": f"@{b['username']}", "description": desc,
+                       "url": bot_url,
+                       "card": f"{bot_url}/.well-known/agent-card.json" if bot_url else ""})
     return {
         "protocolVersion": PROTOCOL_VERSION,
         "name": "tg-gateway hub",
@@ -135,6 +141,7 @@ def hub_card(owner: int, bots: list, *, public_url: str = "") -> Dict[str, Any]:
                                 if public_url else []),
         "url": public_url or "",
         "metadata": {"transport": "telegram", "owner": owner, "bots": len(skills),
+                     "agents": agents,
                      "transportNote": "hub не требует публичного HTTP: агенты пишут "
                                       "JSON-RPC в ЛС бота"},
     }
