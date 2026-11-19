@@ -32,8 +32,14 @@ class FakeTg:
         self.sent.append({"chat": chat_id, "text": text, "buttons": buttons})
         return True, {"message_id": len(self.sent)}
 
-    def edit(self, chat_id, message_id, text):
+    def edit(self, chat_id, message_id, text, buttons=None):
         self.edits.append((chat_id, message_id, text))
+        if buttons:
+            self.sent.append({"chat": chat_id, "text": text, "buttons": buttons, "edited": True})
+        return True, True
+
+    def delete(self, chat_id, message_id):
+        self.calls.append(("deleteMessage", {"chat_id": chat_id, "message_id": message_id}))
         return True, True
 
     def answer_callback(self, callback_id, text=""):
@@ -553,10 +559,22 @@ def run() -> dict:
     menu = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
     flat = [btn[1] for row in menu["buttons"] for btn in row]
     assert "hub:menu:bots" in flat and "hub:menu:protocol" in flat, flat
+    assert "hub:menu:close" in flat, flat
+
     hub.handle(cb(OWNER, "hub:menu:bots", message_id=5))
-    assert "Подключённые боты" in tg.sent[-1]["text"] and "god" in tg.sent[-1]["text"]
-    hub.handle(cb(OWNER, "hub:menu:protocol", message_id=5))
-    assert "message/send" in tg.sent[-1]["text"]
+    section = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
+    assert "Подключённые боты" in section["text"] and "god" in section["text"]
+    assert section.get("edited") is True, "раздел должен редактировать то же сообщение"
+    assert [b[1] for r in section["buttons"] for b in r] == ["hub:menu:main", "hub:menu:close"]
+
+    hub.handle(cb(OWNER, "hub:menu:main", message_id=5))
+    back = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
+    assert "Главное меню" in back["text"]
+    assert "hub:menu:routes" in [b[1] for r in back["buttons"] for b in r]
+
+    hub.handle(cb(OWNER, "hub:menu:close", message_id=5))
+    assert ("deleteMessage" in [c[0] for c in tg.calls]), tg.calls[-3:]
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='menu_closed'")
     res["inline_menu"] = True
 
     hub.handle(msg(OWNER, "/describe"))

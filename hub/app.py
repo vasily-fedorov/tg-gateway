@@ -112,7 +112,7 @@ class Hub:
         if low in ("/start", "/help", "help", "помощь"):
             return self.say(uid, commands.help_text())
         if low == "/menu":
-            return self.tg.send(uid, "Главное меню:", commands.MENU_ROWS)
+            return self.send_menu_section(uid, uid, None, "main")
         if low.startswith("/pair"):
             parts = text.split()
             if len(parts) < 2:
@@ -710,7 +710,7 @@ class Hub:
         _, verdict, task_id = parts
         if verdict == "menu":          # разделы inline-меню — до всякой работы с задачами
             self.tg.answer_callback(cb_id, "")
-            return self.send_menu_section(uid, chat_id, task_id)
+            return self.send_menu_section(uid, chat_id, msg_id, task_id)
         task = self.db.task(task_id)
         if not task:
             self.tg.answer_callback(cb_id, "Задача не найдена")
@@ -767,36 +767,57 @@ class Hub:
         self.finish_card(chat_id, msg_id,
                          f"✅ Отправлено → {task['dst_alias']}" if ok else "❌ Не доставлено")
 
-    def send_menu_section(self, uid: int, chat_id: Any, section: str) -> None:
-        """Разделы inline-меню: текст + кнопки «назад»."""
-        if section == "bots":
-            rows = self.db.bots(uid)
-            text = ("Подключённые боты:\n" + "\n".join(
-                f"• {r['alias']} — @{r['username']} (id {r['bot_id']})" for r in rows)
-                if rows else "Ботов нет. /pair <алиас>")
-        elif section == "routes":
-            rows = self.db.routes(uid)
-            text = ("Маршруты:\n" + "\n".join(
-                f"• {r['src_alias'] or 'вы'} → {r['dst_alias']}: {r['policy']} "
-                f"({r['per_hour']}/час)" for r in rows)
-                if rows else "Маршрутов нет. /route <от> <кому> ask|auto")
-        elif section == "log":
-            rows = self.db.q("SELECT * FROM tasks WHERE owner_tg=? ORDER BY created_at DESC LIMIT 10",
-                             (uid,))
-            text = ("Последние задачи:\n" + "\n".join(
-                f"{r['task_id']}  {r['src_alias']}→{r['dst_alias']}  {r['status']}  h{r['hops']}"
-                for r in rows) if rows else "Задач нет.")
-        elif section == "links":
-            rows = self.db.links_for_owner(uid)
-            text = ("Связи:\n" + "\n".join(
-                f"• #{r['id']} @{r['src_username']} → @{r['dst_username']}" for r in rows)
-                if rows else "Связей нет. /share <алиас>")
-        elif section == "protocol":
-            text = protocol.AGENT_PROTOCOL
+    def send_menu_section(self, uid: int, chat_id: Any, msg_id: Any, section: str) -> None:
+        """Inline-меню: разделы редактируют одно сообщение, «Закрыть» его удаляет."""
+        chat = chat_id or uid
+        if section == "close":
+            ok, info = self.tg.delete(chat, msg_id)
+            self.db.event("menu_closed", owner=uid, ok=bool(ok),
+                          error=None if ok else str(info)[:120])
+            return
+
+        if section in ("", "main"):
+            text = "Главное меню:"
+            rows = [list(r) for r in commands.MENU_ROWS]
+            rows.append([("❌ Закрыть", "hub:menu:close")])
         else:
-            text = commands.help_text()
-        self.tg.send(chat_id or uid, text[:3900],
-                     [[("⬅️ Меню", "hub:menu:help"), ("❌ Закрыть", "hub:menu:close")]])
+            if section == "bots":
+                found = self.db.bots(uid)
+                text = ("Подключённые боты:\n" + "\n".join(
+                    f"• {r['alias']} — @{r['username']} (id {r['bot_id']})" for r in found)
+                    if found else "Ботов нет. /pair <алиас>")
+            elif section == "routes":
+                found = self.db.routes(uid)
+                text = ("Маршруты:\n" + "\n".join(
+                    f"• {r['src_alias'] or 'вы'} → {r['dst_alias']}: {r['policy']} "
+                    f"({r['per_hour']}/час)" for r in found)
+                    if found else "Маршрутов нет. /route <от> <кому> ask|auto")
+            elif section == "log":
+                found = self.db.q("SELECT * FROM tasks WHERE owner_tg=? ORDER BY created_at DESC "
+                                  "LIMIT 10", (uid,))
+                text = ("Последние задачи:\n" + "\n".join(
+                    f"{r['task_id']}  {r['src_alias']}→{r['dst_alias']}  {r['status']}  h{r['hops']}"
+                    for r in found) if found else "Задач нет.")
+            elif section == "links":
+                found = self.db.links_for_owner(uid)
+                text = ("Связи:\n" + "\n".join(
+                    f"• #{r['id']} @{r['src_username']} → @{r['dst_username']}" for r in found)
+                    if found else "Связей нет. /share <алиас>")
+            elif section == "protocol":
+                text = protocol.AGENT_PROTOCOL
+            else:
+                text = commands.help_text()
+            rows = [[("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")]]
+
+        if msg_id:
+            ok, info = self.tg.edit(chat, int(msg_id), text[:3900], rows)
+            if ok:
+                self.db.event("menu_section", owner=uid, section=section, mode="edit")
+                return
+            # сообщение могло устареть (старше 48ч / удалено) — пришлём новое
+            self.db.event("menu_edit_failed", owner=uid, section=section, error=str(info)[:120])
+        ok, info = self.tg.send(chat, text[:3900], rows)
+        self.db.event("menu_section", owner=uid, section=section, ok=bool(ok), mode="send")
 
     def finish_card(self, chat_id: Any, msg_id: Any, text: str) -> None:
         if chat_id and msg_id:

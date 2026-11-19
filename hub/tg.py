@@ -61,8 +61,18 @@ class Tg:
                          reply_markup=markup, reply_to_message_id=reply_to,
                          message_thread_id=thread_id)
 
-    def edit(self, chat_id: Any, message_id: int, text: str) -> Tuple[bool, Any]:
-        return self.call("editMessageText", chat_id=chat_id, message_id=message_id, text=text[:4000])
+    def edit(self, chat_id: Any, message_id: int, text: str,
+             buttons: Optional[List[List[Tuple[str, str]]]] = None) -> Tuple[bool, Any]:
+        markup = None
+        if buttons:
+            markup = json.dumps({"inline_keyboard": [
+                [{"text": label, "callback_data": data} for label, data in row]
+                for row in buttons]})
+        return self.call("editMessageText", chat_id=chat_id, message_id=message_id,
+                         text=text[:4000], reply_markup=markup)
+
+    def delete(self, chat_id: Any, message_id: int) -> Tuple[bool, Any]:
+        return self.call("deleteMessage", chat_id=chat_id, message_id=message_id)
 
     def answer_callback(self, callback_id: str, text: str = "") -> None:
         self.call("answerCallbackQuery", callback_query_id=callback_id, text=text[:200])
