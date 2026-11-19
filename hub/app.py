@@ -848,22 +848,21 @@ class Hub:
             ok = self.deliver(task_id)
             self.db.event("a2a_auto_delivered", task_id=task_id, owner=owner, client=cid,
                           dst=to_alias, ok=bool(ok), length=len(text))
-            task = self.db.task(task_id)
-            return {"task": rpc.task_view(task)}, 0
-        preview = text.replace("\n", " ")[:300] or "(без текста)"
-        ok, res = self.tg.send(owner, f"🌐 Внешний A2A-клиент → «{to_alias}»?\n\n{preview}\n\n"
-                                      f"· задача {task_id} · ctx {ctx}",
-                               [[("Отправить", f"hub:ok:{task_id}"),
-                                 ("Отклонить", f"hub:no:{task_id}")]])
-        if ok and isinstance(res, dict):
-            self.db.update_task(task_id, card_chat=owner, card_msg=res.get("message_id"))
-        self.db.event("a2a_parked", task_id=task_id, owner=owner, client=cid,
-                      dst=to_alias, length=len(text))
+        else:
+            preview = text.replace("\n", " ")[:300] or "(без текста)"
+            ok, res = self.tg.send(owner, f"🌐 Внешний A2A-клиент → «{to_alias}»?\n\n{preview}\n\n"
+                                          f"· задача {task_id} · ctx {ctx}",
+                                   [[("Отправить", f"hub:ok:{task_id}"),
+                                     ("Отклонить", f"hub:no:{task_id}")]])
+            if ok and isinstance(res, dict):
+                self.db.update_task(task_id, card_chat=owner, card_msg=res.get("message_id"))
+            self.db.event("a2a_parked", task_id=task_id, owner=owner, client=cid,
+                          dst=to_alias, length=len(text))
         wait_s = float(params.get("wait_seconds")
                        or (params.get("metadata") or {}).get("wait_seconds")
                        or os.environ.get("TG_GATEWAY_A2A_WAIT") or 0)
         wait_s = max(0.0, min(wait_s, 100.0))
-        if wait_s and mode != "auto":
+        if wait_s:
             deadline = time.time() + wait_s
             while time.time() < deadline:
                 task = self.db.task(task_id)
@@ -874,6 +873,12 @@ class Hub:
                 time.sleep(0.5)
         task = self.db.task(task_id)
         view = rpc.task_view(task)
+        if view["status"]["state"] == "working":
+            view["status"]["message"] = {
+                "role": "agent", "messageId": f"{task_id}-working",
+                "parts": [{"kind": "text",
+                           "text": f"Задача {task_id} в работе у «{to_alias}» — "
+                                   f"результат в tasks/get (contextId {task['ctx']})."}]}
         if view["status"]["state"] == "auth-required":
             view["status"]["message"] = {
                 "role": "agent", "messageId": f"{task_id}-pending",

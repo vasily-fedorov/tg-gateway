@@ -1258,6 +1258,40 @@ def run() -> dict:
 
     res["clients_tokens_limits"] = True
 
+    # 10y. auto-политика: message/send ждёт ответ агента (нативный клиент не поллит)
+    import threading as _th
+    import time as _t2
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub._a2a_public_url = lambda: "https://a2a.example.com"
+    row, _token = hub.db.create_client(owner=OWNER, name="native", bots='["aa"]',
+                                       policy="auto")
+    cl = clientlib.as_client(hub.db.client(OWNER, row["client_id"]))
+    answer: dict = {}
+
+    def slow_call() -> None:
+        answer["v"] = hub.http_rpc("SendMessage", {
+            "to": "aa", "wait_seconds": 8,
+            "message": {"parts": [{"kind": "text", "text": "ответь OK"}]}}, client=cl)
+
+    thread = _th.Thread(target=slow_call)
+    thread.start()
+    _t2.sleep(0.7)
+    sent = [x for x in tg.sent if x["chat"] == AA and x["text"].startswith("{")]
+    assert sent, "задача должна уйти боту без карточки"
+    task_id = json.loads(sent[-1]["text"])["params"]["metadata"]["task"]
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "u-wait", "method": "tasks/update",
+                                   "params": {"task": task_id,
+                                              "status": {"state": "completed"},
+                                              "artifact": {"parts": [{"kind": "text",
+                                                                      "text": "OK"}]}}}),
+                   is_bot=True, username="aa"))
+    thread.join(timeout=10)
+    result, code = answer["v"]
+    assert code == 0 and result["task"]["status"]["state"] == "completed", result
+    assert result["task"]["history"][-1]["parts"][0]["text"] == "OK"
+    res["a2a_native_wait"] = True
+
     # старый самодельный конверт больше не принимается
     hub, tg = new_hub()
     pair(hub, tg, bot_id=GOD, alias="god")
