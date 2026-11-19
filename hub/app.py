@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import secrets
 import sys
@@ -656,6 +657,11 @@ class Hub:
         if owner is None:
             return {"message": "у хаба нет владельца"}, rpc.ERR_INTERNAL
 
+        method = {"SendMessage": "message/send", "GetTask": "tasks/get",
+                  "CancelTask": "tasks/cancel", "ListTasks": "tasks/list",
+                  "GetAgentCard": "agent/card", "StreamMessage": "message/stream"}.get(method, method)
+
+
         if method in ("agent/card", "agent/getCard", "a2a/discover"):
             alias = str(params.get("alias") or "").strip()
             if alias:
@@ -663,7 +669,8 @@ class Hub:
                 if not found:
                     return {"message": f"бот «{alias}» не найден"}, rpc.ERR_TASK_NOT_FOUND
                 return {"card": rpc.bot_card(found, owner)}, 0
-            return {"card": rpc.hub_card(owner, self.db.bots(owner))}, 0
+            return {"card": rpc.hub_card(owner, self.db.bots(owner),
+                                         public_url=self._a2a_public_url())}, 0
 
         if method in ("agent/protocol", "agent/help"):
             return {"protocol": protocol.AGENT_PROTOCOL}, 0
@@ -699,11 +706,25 @@ class Hub:
 
         return {"message": f"неизвестный метод: {method}"}, rpc.ERR_METHOD_NOT_FOUND
 
+    def _a2a_public_url(self) -> str:
+        url = (os.environ.get("TG_GATEWAY_A2A_PUBLIC_URL") or "").strip()
+        if url:
+            return url.rstrip("/")
+        port = (os.environ.get("TG_GATEWAY_A2A_PORT") or "").strip()
+        host = (os.environ.get("TG_GATEWAY_A2A_HOST") or "127.0.0.1").strip()
+        return f"http://{host}:{port}" if port else ""
+
     def _http_message_send(self, owner: int, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
         msg = params.get("message") or {}
         to_alias = str(params.get("to") or msg.get("to") or "").strip()
         if not to_alias:
-            return {"message": "нужен params.to (алиас бота)"}, rpc.ERR_INVALID_PARAMS
+            bots = self.db.bots(owner)
+            if len(bots) == 1:
+                to_alias = str(bots[0]["alias"])
+            else:
+                names = ", ".join(str(b["alias"]) for b in bots)
+                return {"message": "нужен params.to (алиас бота) или путь /bot/<alias>; "
+                                   f"доступны: {names}"}, rpc.ERR_INVALID_PARAMS
         target = self.db.bot_by_alias(owner, to_alias)
         if not target:
             return {"message": f"бот «{to_alias}» не найден"}, rpc.ERR_TASK_NOT_FOUND
@@ -731,7 +752,29 @@ class Hub:
         if ok and isinstance(res, dict):
             self.db.update_task(task_id, card_chat=owner, card_msg=res.get("message_id"))
         self.db.event("a2a_parked", task_id=task_id, owner=owner, dst=to_alias, length=len(text))
-        return {"task": rpc.task_view(self.db.task(task_id))}, 0
+        wait_s = float(params.get("wait_seconds")
+                       or (params.get("metadata") or {}).get("wait_seconds")
+                       or os.environ.get("TG_GATEWAY_A2A_WAIT") or 0)
+        wait_s = max(0.0, min(wait_s, 100.0))
+        if wait_s:
+            deadline = time.time() + wait_s
+            while time.time() < deadline:
+                task = self.db.task(task_id)
+                if task and task["status"] in TERMINAL:
+                    break
+                if task and task["answer"]:
+                    break
+                time.sleep(0.5)
+        task = self.db.task(task_id)
+        view = rpc.task_view(task)
+        if view["status"]["state"] == "auth-required":
+            view["status"]["message"] = {
+                "role": "agent", "messageId": f"{task_id}-pending",
+                "parts": [{"kind": "text",
+                           "text": "Задача ждёт подтверждения владельца в Telegram. "
+                                   f"Готово будет видно через tasks/get (id {task_id}), "
+                                   f"contextId {task['ctx']}."}]}
+        return {"task": view}, 0
 
     def on_reply(self, bot: Any, env: Dict[str, Any]) -> None:
         owner = int(bot["owner_tg"])

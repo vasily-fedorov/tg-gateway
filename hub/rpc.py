@@ -86,7 +86,7 @@ def bot_card(bot: Any, owner: Optional[int] = None) -> Dict[str, Any]:
     }
 
 
-def hub_card(owner: int, bots: list) -> Dict[str, Any]:
+def hub_card(owner: int, bots: list, *, public_url: str = "") -> Dict[str, Any]:
     skills = []
     for b in bots:
         b = dict(b)
@@ -107,6 +107,10 @@ def hub_card(owner: int, bots: list) -> Dict[str, Any]:
         "defaultInputModes": ["text/plain"],
         "defaultOutputModes": ["text/plain"],
         "skills": skills,
+        # v1.0: клиент берёт RPC-URL отсюда (Hermes: supportedInterfaces[JSONRPC])
+        "supportedInterfaces": ([{"protocolBinding": "JSONRPC", "url": public_url}]
+                                if public_url else []),
+        "url": public_url or "",
         "metadata": {"transport": "telegram", "owner": owner, "bots": len(skills),
                      "transportNote": "hub не требует публичного HTTP: агенты пишут "
                                       "JSON-RPC в ЛС бота"},

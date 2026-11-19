@@ -822,13 +822,111 @@ def run() -> dict:
         server.shutdown()
     res["a2a_http_transport"] = True
 
+    # 10r. совместимость с клиентом Hermes: SendMessage, supportedInterfaces, ожидание
+    import threading
+    import time as _time
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub._a2a_public_url = lambda: "http://127.0.0.1:18765"
+
+    card, _ = hub.http_rpc("agent/card", {})
+    ifaces = card["card"]["supportedInterfaces"]
+    assert ifaces and ifaces[0]["protocolBinding"] == "JSONRPC", ifaces
+    assert ifaces[0]["url"] == "http://127.0.0.1:18765"
+    assert card["card"]["url"] == "http://127.0.0.1:18765"
+
+    send, code = hub.http_rpc("SendMessage", {"to": "aa",
+                                             "message": {"parts": [{"kind": "text",
+                                                                    "text": "сколько места?"}]}})
+    assert code == 0, send
+    task_id = send["task"]["id"]
+    assert send["task"]["status"]["state"] == "auth-required"
+    assert "ждёт подтверждения" in send["task"]["status"]["message"]["parts"][0]["text"]
+
+    # без подтверждения tasks/get остаётся auth-required (алиас GetTask)
+    got, _ = hub.http_rpc("GetTask", {"id": task_id})
+    assert got["task"]["status"]["state"] == "auth-required"
+
+    # с wait_seconds клиент дожидается ответа, если владелец успел нажать
+    result: dict = {}
+
+    def call_with_wait() -> None:
+        result["value"] = hub.http_rpc("SendMessage", {
+            "to": "aa", "wait_seconds": 8,
+            "message": {"parts": [{"kind": "text", "text": "второй вопрос"}]}})
+
+    thread = threading.Thread(target=call_with_wait)
+    thread.start()
+    _time.sleep(1.0)
+    waiting = [t for t in hub.db.q("SELECT * FROM tasks WHERE status='submitted' ORDER BY created_at DESC")]
+    second_id = waiting[0]["task_id"]
+    hub.handle(cb(OWNER, f"hub:ok:{second_id}"))
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "u-w", "method": "tasks/update",
+                                   "params": {"task": second_id,
+                                              "status": {"state": "completed"},
+                                              "artifact": {"parts": [{"kind": "text",
+                                                                      "text": "28 ГБ"}]}}}),
+                   is_bot=True, username="aa"))
+    thread.join(timeout=10)
+    reply, code = result["value"]
+    assert code == 0 and reply["task"]["status"]["state"] in ("completed", "working"), reply
+    res["a2a_hermes_client_compat"] = True
+
+    # 10s. путь /bot/<alias> = отдельный A2A-агент (клиент Hermes не умеет params.to)
+    import urllib.request
+    from hub import a2a_http
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub._a2a_public_url = lambda: "http://127.0.0.1:18765"
+    server = a2a_http.start(hub, port=0, token="tok")
+    try:
+        port = server.server_address[1]
+        hdr = {"Authorization": "Bearer tok"}
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/bot/aa/.well-known/agent-card.json", headers=hdr)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            bot_card = json.load(r)
+        assert bot_card["supportedInterfaces"][0]["url"].endswith("/bot/aa"), bot_card
+        assert "aa" in json.dumps(bot_card)
+
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/bot/aa/", method="POST",
+                                     data=json.dumps({"jsonrpc": "2.0", "id": 2,
+                                                      "method": "SendMessage",
+                                                      "params": {"message": {"parts": [
+                                                          {"kind": "text",
+                                                           "text": "по пути /bot/aa"}]}}}).encode(),
+                                     headers={**hdr, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            out = json.load(r)
+        assert out["result"]["task"]["status"]["state"] == "auth-required", out
+        dst = hub.db.q("SELECT dst_alias FROM tasks ORDER BY created_at DESC LIMIT 1")[0]["dst_alias"]
+        assert dst == "aa", dst
+
+        bad = urllib.request.Request(f"http://127.0.0.1:{port}/bot/zz/.well-known/agent-card.json",
+                                     headers=hdr)
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+            raise AssertionError("неизвестный алиас должен давать 404")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 404, exc.code
+    finally:
+        server.shutdown()
+    res["a2a_path_routing"] = True
+
     # старый самодельный конверт больше не принимается
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),
                    is_bot=True, username="god"))
     assert len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]]) == before_cards
-    last = json.loads(tg.sent[-1]["text"])
-    assert "error" in last or "Связь" in tg.sent[-1]["text"], last
+    parsed = []
+    for item in [x for x in tg.sent if x["chat"] == GOD]:
+        try:
+            parsed.append(json.loads(item["text"]))
+        except ValueError:
+            continue
+    assert any("error" in item for item in parsed), parsed[-2:]
     res["legacy_envelope_rejected"] = True
 
     # 11. policy-функции

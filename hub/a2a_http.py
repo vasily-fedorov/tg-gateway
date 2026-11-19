@@ -59,8 +59,28 @@ class _Handler(BaseHTTPRequestHandler):
         return data, None
 
     # ── GET: discovery ───────────────────────────────────────────────────────
-    def do_GET(self) -> None:  # noqa: N802
+    # ── роутинг по пути: /bot/<alias> = отдельный агент ─────────────────────
+    def _alias(self) -> Optional[str]:
+        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        if len(parts) >= 2 and parts[0] == "bot":
+            return parts[1]
+        return None
+
+    def _normalized_path(self) -> str:
         path = self.path.split("?")[0]
+        alias = self._alias()
+        if alias:
+            path = "/" + "/".join(p for p in path.split("/") if p and p != "bot" and p != alias)
+            if not path.endswith("/.well-known/agent-card.json") and path in ("/", ""):
+                path = "/"
+        return path
+
+    def _owner(self) -> Optional[int]:
+        return next(iter(self.hub.owners)) if self.hub.owners else None
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self._normalized_path()
+        alias = self._alias()
         if path not in ("/.well-known/agent-card.json", "/.well-known/agent.json",
                         "/health", "/card"):
             return self._send(404, {"error": "not found"})
@@ -68,10 +88,20 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(401, {"error": "unauthorized"})
         if path == "/health":
             return self._send(200, {"ok": True})
-        owner = next(iter(self.hub.owners)) if self.hub.owners else None
-        card = rpc.hub_card(owner, self.hub.db.bots(owner)) if owner else {}
+        owner = self._owner()
+        if alias:
+            bot = self.hub.db.bot_by_alias(owner, alias) if owner else None
+            if not bot:
+                return self._send(404, {"error": f"бот «{alias}» не найден"})
+            url = f"{self.hub._a2a_public_url()}/bot/{alias}"
+            card = rpc.bot_card(bot, owner)
+            card["supportedInterfaces"] = [{"protocolBinding": "JSONRPC", "url": url}]
+            card["url"] = url
+        else:
+            card = (rpc.hub_card(owner, self.hub.db.bots(owner),
+                                 public_url=self.hub._a2a_public_url()) if owner else {})
         card["metadata"] = {**card.get("metadata", {}), "transport": "http-a2a-proxy",
-                            "upstream": "telegram"}
+                            "upstream": "telegram", "bot": alias}
         return self._send(200, card)
 
     # ── POST: JSON-RPC ───────────────────────────────────────────────────────
@@ -84,6 +114,9 @@ class _Handler(BaseHTTPRequestHandler):
         rpc_id = payload.get("id")
         method = str(payload.get("method") or "")
         params = payload.get("params") or {}
+        alias = self._alias()
+        if alias and isinstance(params, dict):
+            params.setdefault("to", alias)
         try:
             result, code = self.hub.http_rpc(method, params)
         except Exception as exc:  # noqa: BLE001
