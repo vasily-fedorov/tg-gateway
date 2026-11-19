@@ -124,10 +124,10 @@ class _Handler(BaseHTTPRequestHandler):
         if path not in ("/.well-known/agent-card.json", "/.well-known/agent.json",
                         "/health", "/card"):
             return self._send(404, {"error": "not found"})
+        if path == "/health":                    # liveness-проба: ничего не раскрывает
+            return self._send(200, {"ok": True})
         if not self._auth_ok() and not (self._card_public() and path in self.CARD_PATHS):
             return self._send(401, {"error": "unauthorized"})
-        if path == "/health":
-            return self._send(200, {"ok": True})
         owner = self._owner()
         allowed = client.get("bots_set") if kind == "client" else None
         anon = kind is None                      # публичная карточка без токена

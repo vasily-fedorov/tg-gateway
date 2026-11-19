@@ -1246,6 +1246,9 @@ def run() -> dict:
             raise AssertionError("POST без токена должен быть 401")
         except urllib.error.HTTPError as exc:
             assert exc.code == 401, exc.code
+        # health открыт без токена, но не раскрывает данных
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as r:
+            assert json.load(r) == {"ok": True}
         os.environ.pop("TG_GATEWAY_A2A_PUBLIC_CARD", None)
     finally:
         server.shutdown()
