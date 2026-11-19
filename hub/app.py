@@ -711,6 +711,18 @@ class Hub:
         if verdict == "menu":          # разделы inline-меню — до всякой работы с задачами
             self.tg.answer_callback(cb_id, "")
             return self.send_menu_section(uid, chat_id, msg_id, task_id)
+        if verdict in ("card", "route", "rpol", "rlim", "task", "tcancel"):
+            self.tg.answer_callback(cb_id, "")
+            if verdict == "card":
+                return self.send_bot_card(uid, chat_id, msg_id, task_id)
+            if verdict == "route":
+                return self.send_route(uid, chat_id, msg_id, task_id)
+            if verdict in ("rpol", "rlim"):
+                return self.toggle_route(uid, chat_id, msg_id, task_id, verdict)
+            if verdict == "task":
+                return self.send_task_card(uid, chat_id, msg_id, task_id)
+            if verdict == "tcancel":
+                return self.cancel_from_menu(uid, chat_id, msg_id, task_id)
         task = self.db.task(task_id)
         if not task:
             self.tg.answer_callback(cb_id, "Задача не найдена")
@@ -767,6 +779,107 @@ class Hub:
         self.finish_card(chat_id, msg_id,
                          f"✅ Отправлено → {task['dst_alias']}" if ok else "❌ Не доставлено")
 
+    def _show(self, uid: int, chat: Any, msg_id: Any, text: str, rows: list) -> bool:
+        """Показать экран: правим сообщение, если можем, иначе шлём новое."""
+        if msg_id:
+            ok, info = self.tg.edit(chat or uid, int(msg_id), text[:3900], rows)
+            if ok:
+                return True
+            self.db.event("menu_edit_failed", owner=uid, error=str(info)[:120])
+        ok, _ = self.tg.send(chat or uid, text[:3900], rows)
+        return bool(ok)
+
+    def send_bot_card(self, uid: int, chat: Any, msg_id: Any, alias: str) -> None:
+        bot = self.db.bot_by_alias(uid, alias)
+        back = [[("⬅️ Боты", "hub:menu:bots"), ("❌ Закрыть", "hub:menu:close")]]
+        if not bot:
+            return self._show(uid, chat, msg_id, f"Бота «{alias}» нет.", back)
+        card = rpc.bot_card(bot, uid)
+        caps = card["capabilities"]
+        text = (f"🪪 {card['name']}  ({alias})\n{card['description']}\n\n"
+                f"protocol: {card['protocolVersion']}\n"
+                f"capabilities: streaming={caps['streaming']}, "
+                f"push={caps['pushNotifications']}, humanApproval={caps['humanApproval']}\n"
+                f"skills: {', '.join(s['id'] for s in card['skills']) or '—'}\n"
+                f"bot_id: {bot['bot_id']}")
+        self.db.event("menu_bot_card", owner=uid, alias=alias)
+        self._show(uid, chat, msg_id, text, back)
+
+    def send_route(self, uid: int, chat: Any, msg_id: Any, route_id: str) -> None:
+        back = [[("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")]]
+        route = self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
+                            (int(route_id), uid)) if str(route_id).isdigit() else None
+        if not route:
+            return self._show(uid, chat, msg_id, "Маршрут не найден.", back)
+        policy = str(route["policy"])
+        per_hour = int(route["per_hour"])
+        next_limit = next((x for x in (5, 20, 50, 100) if x > per_hour), 5)
+        text = (f"🔀 {route['src_alias'] or 'вы'} → {route['dst_alias']}\n\n"
+                f"политика: {policy} "
+                f"({'спрашивать владельца' if policy == 'ask' else 'продолжения без карточки'})\n"
+                f"лимит: {per_hour}/час · max_text: {route['max_text']}\n"
+                f"id: {route['id']}")
+        rows = [
+            [(f"Политика → {'auto' if policy == 'ask' else 'ask'}", f"hub:rpol:{route['id']}")],
+            [(f"Лимит → {next_limit}/час", f"hub:rlim:{route['id']}")],
+            *back,
+        ]
+        self.db.event("menu_route", owner=uid, route=int(route["id"]))
+        self._show(uid, chat, msg_id, text, rows)
+
+    def toggle_route(self, uid: int, chat: Any, msg_id: Any, route_id: str, kind: str) -> None:
+        route = self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
+                            (int(route_id), uid)) if str(route_id).isdigit() else None
+        if not route:
+            return self.send_route(uid, chat, msg_id, route_id)
+        policy = str(route["policy"])
+        per_hour = int(route["per_hour"])
+        if kind == "rpol":
+            policy = "auto" if policy == "ask" else "ask"
+        else:
+            per_hour = next((x for x in (5, 20, 50, 100) if x > per_hour), 5)
+        self.db.set_route(uid, str(route["src_alias"]), str(route["dst_alias"]),
+                          policy=policy, max_text=int(route["max_text"]), per_hour=per_hour)
+        self.db.event("route_updated", owner=uid, route=int(route["id"]),
+                      policy=policy, per_hour=per_hour)
+        self.send_route(uid, chat, msg_id, route_id)
+
+    def send_task_card(self, uid: int, chat: Any, msg_id: Any, task_id: str) -> None:
+        back = [[("⬅️ Задачи", "hub:menu:log"), ("❌ Закрыть", "hub:menu:close")]]
+        task = self.db.task(task_id)
+        if not task or int(task["owner_tg"]) != uid:
+            return self._show(uid, chat, msg_id, "Задача не найдена.", back)
+        view = rpc.task_view(task)
+        lines = [f"🗂 {task_id}   {task['src_alias']}→{task['dst_alias']}",
+                 f"состояние: {view['status']['state']} ({task['status']}) · hops {task['hops']}"
+                 f" · ctx {task['ctx']}",
+                 f"текст: {(task['text'] or '')[:400]}"]
+        if task["question"]:
+            lines.append(f"вопрос: {task['question'][:300]}")
+        if task["answer"]:
+            lines.append(f"ответ: {task['answer'][:300]}")
+        events = self.db.q("SELECT kind FROM events WHERE task_id=? ORDER BY id", (task_id,))
+        lines.append("события: " + ", ".join(e["kind"] for e in events[-8:]))
+        rows = []
+        if task["status"] not in TERMINAL:
+            rows.append([("❌ Отменить задачу", f"hub:tcancel:{task_id}")])
+        rows.extend(back)
+        self.db.event("menu_task", owner=uid, task=task_id)
+        self._show(uid, chat, msg_id, "\n".join(lines), rows)
+
+    def cancel_from_menu(self, uid: int, chat: Any, msg_id: Any, task_id: str) -> None:
+        task = self.db.task(task_id)
+        if not task or int(task["owner_tg"]) != uid:
+            return self.send_task_card(uid, chat, msg_id, task_id)
+        if task["status"] in TERMINAL:
+            self.tg.answer_callback("", "")
+            return self.send_task_card(uid, chat, msg_id, task_id)
+        self.db.update_task(task_id, status="cancelled")
+        self.db.event("task_cancelled", task_id=task_id, owner=uid, via="menu")
+        if task["dst_alias"]:
+            self._notify_cancel(str(task["dst_alias"]), uid, task_id)
+        self.send_task_card(uid, chat, msg_id, task_id)
+
     def send_menu_section(self, uid: int, chat_id: Any, msg_id: Any, section: str) -> None:
         """Inline-меню: разделы редактируют одно сообщение, «Закрыть» его удаляет."""
         chat = chat_id or uid
@@ -781,23 +894,28 @@ class Hub:
             rows = [list(r) for r in commands.MENU_ROWS]
             rows.append([("❌ Закрыть", "hub:menu:close")])
         else:
+            rows = None
             if section == "bots":
                 found = self.db.bots(uid)
-                text = ("Подключённые боты:\n" + "\n".join(
-                    f"• {r['alias']} — @{r['username']} (id {r['bot_id']})" for r in found)
-                    if found else "Ботов нет. /pair <алиас>")
+                text = ("Подключённые боты — нажмите, чтобы открыть agent card:"
+                        if found else "Ботов нет. /pair <алиас>")
+                rows = [[(f"🪪 {r['alias']} · @{r['username']}", f"hub:card:{r['alias']}")]
+                        for r in found] or []
+                rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
             elif section == "routes":
                 found = self.db.routes(uid)
-                text = ("Маршруты:\n" + "\n".join(
-                    f"• {r['src_alias'] or 'вы'} → {r['dst_alias']}: {r['policy']} "
-                    f"({r['per_hour']}/час)" for r in found)
-                    if found else "Маршрутов нет. /route <от> <кому> ask|auto")
+                text = ("Маршруты — нажмите, чтобы настроить:" if found
+                        else "Маршрутов нет. /route <от> <кому> ask|auto")
+                rows = [[(f"🔀 {r['src_alias'] or 'вы'} → {r['dst_alias']} · {r['policy']}",
+                          f"hub:route:{r['id']}")] for r in found] or []
+                rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
             elif section == "log":
                 found = self.db.q("SELECT * FROM tasks WHERE owner_tg=? ORDER BY created_at DESC "
-                                  "LIMIT 10", (uid,))
-                text = ("Последние задачи:\n" + "\n".join(
-                    f"{r['task_id']}  {r['src_alias']}→{r['dst_alias']}  {r['status']}  h{r['hops']}"
-                    for r in found) if found else "Задач нет.")
+                                  "LIMIT 8", (uid,))
+                text = ("Последние задачи — нажмите для деталей:" if found else "Задач нет.")
+                rows = [[(f"{r['task_id']} · {r['src_alias']}→{r['dst_alias']} · {r['status']}",
+                          f"hub:task:{r['task_id']}")] for r in found] or []
+                rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
             elif section == "links":
                 found = self.db.links_for_owner(uid)
                 text = ("Связи:\n" + "\n".join(
@@ -807,7 +925,8 @@ class Hub:
                 text = protocol.AGENT_PROTOCOL
             else:
                 text = commands.help_text()
-            rows = [[("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")]]
+            if not rows:
+                rows = [[("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")]]
 
         if msg_id:
             ok, info = self.tg.edit(chat, int(msg_id), text[:3900], rows)

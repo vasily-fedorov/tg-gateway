@@ -563,9 +563,10 @@ def run() -> dict:
 
     hub.handle(cb(OWNER, "hub:menu:bots", message_id=5))
     section = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
-    assert "Подключённые боты" in section["text"] and "god" in section["text"]
+    assert "Подключённые боты" in section["text"]
     assert section.get("edited") is True, "раздел должен редактировать то же сообщение"
-    assert [b[1] for r in section["buttons"] for b in r] == ["hub:menu:main", "hub:menu:close"]
+    flat_bots = [b[1] for r in section["buttons"] for b in r]
+    assert "hub:card:god" in flat_bots and flat_bots[-2:] == ["hub:menu:main", "hub:menu:close"]
 
     hub.handle(cb(OWNER, "hub:menu:main", message_id=5))
     back = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
@@ -587,6 +588,51 @@ def run() -> dict:
     hub.handle(msg(OWNER, "/describe god"))
     assert "смотрит диск" in tg.sent[-1]["text"]
     res["describe_three_forms"] = True
+
+    # 10m. меню: agent card из «Ботов», настройка маршрута, детали и отмена задачи
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.db.set_route(OWNER, "god", "aa", policy="ask", per_hour=20)
+
+    hub.handle(cb(OWNER, "hub:menu:bots", message_id=7))
+    bots_screen = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"] and x.get("edited")][-1]
+    assert any(b[1] == "hub:card:god" for r in bots_screen["buttons"] for b in r), bots_screen
+    hub.handle(cb(OWNER, "hub:card:god", message_id=7))
+    card_screen = tg.sent[-1]
+    assert "@god" in card_screen["text"] and "protocol:" in card_screen["text"], card_screen["text"]
+    assert "humanApproval=True" in card_screen["text"]
+    res["menu_bot_card"] = True
+
+    hub.handle(cb(OWNER, "hub:menu:routes", message_id=7))
+    routes_screen = [x for x in tg.sent if x.get("edited")][-1]
+    route_btn = [b[1] for r in routes_screen["buttons"] for b in r
+                 if b[1].startswith("hub:route:")][0]
+    hub.handle(cb(OWNER, route_btn, message_id=7))
+    assert "политика: ask" in tg.sent[-1]["text"], tg.sent[-1]["text"]
+    rid = route_btn.split(":")[2]
+    hub.handle(cb(OWNER, f"hub:rpol:{rid}", message_id=7))
+    assert "политика: auto" in tg.sent[-1]["text"], tg.sent[-1]["text"]
+    assert hub.db.route(OWNER, "god", "aa")["policy"] == "auto"
+    hub.handle(cb(OWNER, f"hub:rlim:{rid}", message_id=7))
+    assert hub.db.route(OWNER, "god", "aa")["per_hour"] == 50
+    res["menu_route_settings"] = True
+
+    send_relay(hub, "задача для отмены")
+    new_task = hub.db.q("SELECT task_id FROM tasks ORDER BY created_at DESC LIMIT 1")[0]["task_id"]
+    hub.handle(cb(OWNER, "hub:menu:log", message_id=7))
+    log_screen = [x for x in tg.sent if x.get("edited")][-1]
+    assert any(b[1] == f"hub:task:{new_task}" for r in log_screen["buttons"] for b in r)
+    hub.handle(cb(OWNER, f"hub:task:{new_task}", message_id=7))
+    detail = tg.sent[-1]
+    assert new_task in detail["text"] and "состояние:" in detail["text"]
+    cancel_btn = [b[1] for r in detail["buttons"] for b in r if b[1].startswith("hub:tcancel:")]
+    assert cancel_btn == [f"hub:tcancel:{new_task}"], detail["buttons"]
+    hub.handle(cb(OWNER, cancel_btn[0], message_id=7))
+    assert hub.db.task(new_task)["status"] == "cancelled"
+    after = tg.sent[-1]
+    assert not any(b[1].startswith("hub:tcancel:") for r in after["buttons"] for b in r), after
+    res["menu_task_details_and_cancel"] = True
 
     # старый самодельный конверт больше не принимается
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
