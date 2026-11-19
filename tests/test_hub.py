@@ -248,7 +248,7 @@ def run() -> dict:
     hub.handle(msg(OWNER, "/bots"))
     assert "owner_b_bot" not in tg.sent[-1]["text"]
     hub.handle(msg(OWNER_B, "/bots"))
-    assert "owner_b_bot" in tg.sent[-1]["text"] and "gateway_beta" not in tg.sent[-1]["text"]
+    assert "owner_b_bot" in tg.sent[-1]["text"] and "peer_bot" not in tg.sent[-1]["text"]
     res["multi_tenant_isolation"] = True
 
     # 10c. чужая карточка не подтверждается
