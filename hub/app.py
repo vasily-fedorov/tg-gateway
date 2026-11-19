@@ -714,14 +714,14 @@ class Hub:
         if uid not in self.owners and not self.db.owner(uid):
             return self.tg.answer_callback(cb_id, "Нет прав")
         parts = data.split(":")
-        if len(parts) != 3 or parts[0] != "hub":
+        if len(parts) < 3 or parts[0] != "hub":
             return self.tg.answer_callback(cb_id, "Непонятная карточка")
-        _, verdict, task_id = parts
+        verdict, task_id = parts[1], ":".join(parts[2:])
         if verdict == "menu":          # разделы inline-меню — до всякой работы с задачами
             self.tg.answer_callback(cb_id, "")
             return self.send_menu_section(uid, chat_id, msg_id, task_id)
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
-                       "desc", "new"):
+                       "desc", "new", "newr"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -733,6 +733,9 @@ class Hub:
                 return self.begin_describe(uid, chat_id, msg_id, task_id)
             if verdict == "new":
                 return self.begin_new(uid, chat_id, msg_id, task_id)
+            if verdict == "newr":
+                step, _, value = task_id.partition(":")
+                return self.route_wizard(uid, chat_id, msg_id, step, value)
             if verdict == "task":
                 return self.send_task_card(uid, chat_id, msg_id, task_id)
             if verdict == "tcancel":
@@ -811,11 +814,66 @@ class Hub:
                        "«/pair <код> <алиас>». /cancel — отменить.",
                        [[("⬅️ Боты", "hub:menu:bots"), ("❌ Закрыть", "hub:menu:close")]])
             return
-        self.db.set_state(uid, "new_route")
-        self._show(uid, chat, msg_id,
-                   "Пришлите маршрут одной строкой: <от> <кому> [ask|auto]\n"
-                   "«-» вместо отправителя = вы. Пример: god aa ask",
-                   [[("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")]])
+        self.db.set_state(uid, "new_route", "{}")
+        return self.route_wizard(uid, chat, msg_id, "src", "")
+
+    def route_wizard(self, uid: int, chat: Any, msg_id: Any, step: str, value: str) -> None:
+        """Пошаговое создание маршрута: отправитель → получатель → политика."""
+        st = self.db.get_state(uid)
+        draft = {}
+        if st and str(st["action"]) == "new_route":
+            try:
+                draft = json.loads(st["payload"] or "{}")
+            except ValueError:
+                draft = {}
+
+        if step == "reset":
+            self.db.clear_state(uid)
+            draft = {"src": ""}
+            self.db.set_state(uid, "new_route", json.dumps(draft, ensure_ascii=False))
+            return self.route_wizard(uid, chat, msg_id, "src", "")
+
+        if step == "src" and not value:
+            draft = {"src": ""}
+            self.db.set_state(uid, "new_route", json.dumps(draft, ensure_ascii=False))
+            rows = [[("— это я —", "hub:newr:src:-")]]
+            rows += [[(f"🪪 {b['alias']}", f"hub:newr:src:{b['alias']}")]
+                     for b in self.db.bots(uid)]
+            rows.append([("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")])
+            return self._show(uid, chat, msg_id, "Новый маршрут. Шаг 1/3: кто отправляет?", rows)
+
+        if step == "src":
+            draft["src"] = "" if value in ("-", "") else value
+            self.db.set_state(uid, "new_route", json.dumps(draft, ensure_ascii=False))
+            rows = [[(f"🪪 {b['alias']}", f"hub:newr:dst:{b['alias']}")]
+                    for b in self.db.bots(uid) if b["alias"] != draft.get("src")]
+            rows.append([("⬅️ Назад", "hub:newr:reset"), ("❌ Закрыть", "hub:menu:close")])
+            return self._show(uid, chat, msg_id,
+                              f"Новый маршрут {draft.get('src') or 'вы'} → ? Шаг 2/3: кому?", rows)
+
+        if step == "dst":
+            draft["dst"] = value
+            self.db.set_state(uid, "new_route", json.dumps(draft, ensure_ascii=False))
+            rows = [[("ask — спрашивать владельца", "hub:newr:pol:ask"),
+                     ("auto — без карточки", "hub:newr:pol:auto")],
+                    [("⬅️ Назад", "hub:newr:reset"), ("❌ Закрыть", "hub:menu:close")]]
+            return self._show(uid, chat, msg_id,
+                              f"Новый маршрут {draft.get('src') or 'вы'} → {value}. "
+                              "Шаг 3/3: когда спрашивать?", rows)
+
+        if step == "pol":
+            src = str(draft.get("src") or "")
+            dst = str(draft.get("dst") or "")
+            policy = value if value in ("ask", "auto") else "ask"
+            if not dst:
+                return self.route_wizard(uid, chat, msg_id, "src", "")
+            self.db.set_route(uid, src, dst, policy=policy)
+            self.db.clear_state(uid)
+            self.db.event("route_created", owner=uid, src=src, dst=dst, policy=policy, via="menu")
+            route = self.db.route(uid, src, dst)
+            return self.send_route(uid, chat, msg_id, str(route["id"]))
+
+        return self.route_wizard(uid, chat, msg_id, "src", "")
 
     def handle_state_input(self, uid: int, action: str, payload: str, text: str) -> None:
         """Текст, присланный в ответ на запрос из меню."""

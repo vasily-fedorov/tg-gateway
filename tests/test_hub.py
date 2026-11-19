@@ -662,9 +662,24 @@ def run() -> dict:
     hub.handle(cb(OWNER, "hub:menu:routes", message_id=11))
     assert any(b[1] == "hub:new:route" for r in tg.sent[-1]["buttons"] for b in r)
     hub.handle(cb(OWNER, "hub:new:route", message_id=11))
-    assert "маршрут одной строкой" in tg.sent[-1]["text"]
-    hub.handle(msg(OWNER, "god bb auto"))
+    step1 = tg.sent[-1]
+    assert "Шаг 1/3" in step1["text"], step1["text"]
+    flats = [b[1] for r in step1["buttons"] for b in r]
+    assert "hub:newr:src:-" in flats and "hub:newr:src:god" in flats, flats
+    hub.handle(cb(OWNER, "hub:newr:src:god", message_id=11))
+    step2 = tg.sent[-1]
+    assert "Шаг 2/3" in step2["text"], step2["text"]
+    dst_flat = [b[1] for r in step2["buttons"] for b in r]
+    assert "hub:newr:dst:bb" in dst_flat and "hub:newr:dst:god" not in dst_flat, dst_flat
+    hub.handle(cb(OWNER, "hub:newr:dst:bb", message_id=11))
+    step3 = tg.sent[-1]
+    assert "Шаг 3/3" in step3["text"], step3["text"]
+    pol_flat = [b[1] for r in step3["buttons"] for b in r]
+    assert "hub:newr:pol:ask" in pol_flat and "hub:newr:pol:auto" in pol_flat, pol_flat
+    hub.handle(cb(OWNER, "hub:newr:pol:auto", message_id=11))
     assert hub.db.route(OWNER, "god", "bb")["policy"] == "auto"
+    assert "политика: auto" in tg.sent[-1]["text"], tg.sent[-1]["text"]
+    assert hub.db.get_state(OWNER) is None
     res["menu_new_route"] = True
 
     rid = hub.db.route(OWNER, "god", "bb")["id"]
@@ -674,8 +689,9 @@ def run() -> dict:
     assert hub.db.route(OWNER, "god", "bb")["max_text"] == 4000
     res["menu_max_text"] = True
 
-    # /cancel сбрасывает ожидание ввода
-    hub.handle(cb(OWNER, "hub:new:route", message_id=11))
+    # /cancel сбрасывает ожидание ввода (на примере описания бота)
+    hub.handle(cb(OWNER, "hub:desc:bb", message_id=11))
+    assert hub.db.get_state(OWNER) is not None
     hub.handle(msg(OWNER, "/cancel"))
     assert "отменён" in tg.sent[-1]["text"]
     assert hub.db.get_state(OWNER) is None
