@@ -747,6 +747,81 @@ def run() -> dict:
     assert hub.db.q("SELECT 1 FROM events WHERE kind='menu_task_full'")
     res["menu_task_body_and_full"] = True
 
+    # 10q. A2A-прокси: стандартный клиент по HTTP/JSON-RPC
+    import urllib.request
+    from hub import a2a_http
+
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+
+    sent_task, code = hub.http_rpc("message/send", {
+        "to": "aa", "message": {"parts": [{"kind": "text", "text": "сколько места на /?"}]}})
+    assert code == 0, sent_task
+    assert sent_task["task"]["status"]["state"] == "auth-required", sent_task
+    task_id = sent_task["task"]["id"]
+    assert any(x["chat"] == OWNER and x["buttons"] for x in tg.sent), "карточка владельцу"
+
+    got, code = hub.http_rpc("tasks/get", {"id": task_id})
+    assert code == 0 and got["task"]["status"]["state"] == "auth-required"
+
+    hub.handle(cb(OWNER, f"hub:ok:{task_id}"))
+    assert any(json.loads(x["text"]).get("method") == "message/send"
+               for x in tg.sent if x["chat"] == AA and x["text"].startswith("{")), "не доставлено боту"
+
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "u-a", "method": "tasks/update",
+                                   "params": {"task": task_id,
+                                              "status": {"state": "completed"},
+                                              "artifact": {"parts": [{"kind": "text",
+                                                                      "text": "31 ГБ"}]}}}),
+                   is_bot=True, username="aa"))
+    got, _ = hub.http_rpc("tasks/get", {"id": task_id})
+    assert got["task"]["status"]["state"] == "completed", got
+    assert "31 ГБ" in json.dumps(got["task"], ensure_ascii=False)
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='a2a_answered'")
+    # отмена задачи внешнего клиента
+    t2, _ = hub.http_rpc("message/send", {"to": "aa", "message": {"parts": [{"kind": "text",
+                                                                            "text": "вторая"}]}})
+    cancelled, code = hub.http_rpc("tasks/cancel", {"id": t2["task"]["id"]})
+    assert code == 0 and cancelled["task"]["status"]["state"] == "canceled", cancelled
+    res["a2a_http_rpc"] = True
+
+    # реальный HTTP: карточка discovery + токен
+    server = a2a_http.start(hub, port=0, token="secret-token")
+    try:
+        port = server.server_address[1]
+        base = f"http://127.0.0.1:{port}"
+        card_req = urllib.request.Request(base + "/.well-known/agent-card.json",
+                                          headers={"Authorization": "Bearer secret-token"})
+        with urllib.request.urlopen(card_req, timeout=5) as r:
+            card = json.load(r)
+        assert card["protocolVersion"] and "skills" in card, card
+        assert card["capabilities"]["streaming"] is False
+
+        req = urllib.request.Request(base + "/", method="POST",
+                                     data=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                                      "method": "message/send",
+                                                      "params": {"to": "aa",
+                                                                 "message": {"parts": [
+                                                                     {"kind": "text",
+                                                                      "text": "http?"}]}}}).encode(),
+                                     headers={"Content-Type": "application/json",
+                                              "Authorization": "Bearer secret-token"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            reply = json.load(r)
+        assert reply["result"]["task"]["status"]["state"] == "auth-required", reply
+
+        bad = urllib.request.Request(base + "/", method="POST", data=b"{}",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(bad, timeout=5)
+            raise AssertionError("без токена должно быть 401")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, exc.code
+    finally:
+        server.shutdown()
+    res["a2a_http_transport"] = True
+
     # старый самодельный конверт больше не принимается
     before_cards = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
     hub.handle(msg(GOD, json.dumps({"t": "relay", "to": "aa", "text": "старый формат"}),

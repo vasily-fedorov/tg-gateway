@@ -647,6 +647,92 @@ class Hub:
         return bool(ok)
 
     # ── ответ агента ─────────────────────────────────────────────────────────
+    def _is_a2a_task(self, task: Any) -> bool:
+        return str(task["src_alias"] or "") == "a2a-client"
+
+    def http_rpc(self, method: str, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+        """JSON-RPC из HTTP-фронта (стандартный A2A-клиент). (result, код ошибки)."""
+        owner = next(iter(self.owners)) if self.owners else None
+        if owner is None:
+            return {"message": "у хаба нет владельца"}, rpc.ERR_INTERNAL
+
+        if method in ("agent/card", "agent/getCard", "a2a/discover"):
+            alias = str(params.get("alias") or "").strip()
+            if alias:
+                found = self.db.bot_by_alias(owner, alias)
+                if not found:
+                    return {"message": f"бот «{alias}» не найден"}, rpc.ERR_TASK_NOT_FOUND
+                return {"card": rpc.bot_card(found, owner)}, 0
+            return {"card": rpc.hub_card(owner, self.db.bots(owner))}, 0
+
+        if method in ("agent/protocol", "agent/help"):
+            return {"protocol": protocol.AGENT_PROTOCOL}, 0
+
+        if method in ("message/send", "message/stream"):
+            return self._http_message_send(owner, params)
+
+        if method == "tasks/get":
+            task = self.db.task(str(params.get("id") or ""))
+            if not task or int(task["owner_tg"]) != owner:
+                return {"message": "задача не найдена"}, rpc.ERR_TASK_NOT_FOUND
+            return {"task": rpc.task_view(task)}, 0
+
+        if method in ("tasks/list", "tasks/poll"):
+            since = float(params.get("since") or 0)
+            rows = self.db.q("SELECT * FROM tasks WHERE owner_tg=? AND updated_at > ? "
+                             "ORDER BY updated_at LIMIT ?",
+                             (owner, since, int(params.get("limit") or 50)))
+            cursor = max([float(r["updated_at"]) for r in rows], default=since)
+            return {"tasks": [rpc.task_view(r) for r in rows], "cursor": cursor}, 0
+
+        if method == "tasks/cancel":
+            task = self.db.task(str(params.get("id") or ""))
+            if not task or int(task["owner_tg"]) != owner:
+                return {"message": "задача не найдена"}, rpc.ERR_TASK_NOT_FOUND
+            if task["status"] in TERMINAL:
+                return {"message": f"задача уже {task['status']}"}, rpc.ERR_TASK_NOT_CANCELABLE
+            self.db.update_task(str(task["task_id"]), status="cancelled")
+            self.db.event("task_cancelled", task_id=task["task_id"], owner=owner, via="a2a")
+            if task["dst_alias"]:
+                self._notify_cancel(str(task["dst_alias"]), owner, str(task["task_id"]))
+            return {"task": rpc.task_view(self.db.task(str(task["task_id"])))}, 0
+
+        return {"message": f"неизвестный метод: {method}"}, rpc.ERR_METHOD_NOT_FOUND
+
+    def _http_message_send(self, owner: int, params: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:
+        msg = params.get("message") or {}
+        to_alias = str(params.get("to") or msg.get("to") or "").strip()
+        if not to_alias:
+            return {"message": "нужен params.to (алиас бота)"}, rpc.ERR_INVALID_PARAMS
+        target = self.db.bot_by_alias(owner, to_alias)
+        if not target:
+            return {"message": f"бот «{to_alias}» не найден"}, rpc.ERR_TASK_NOT_FOUND
+        chunks, attachments = [], []
+        for part in (msg.get("parts") or []):
+            kind = str(part.get("kind") or "text")
+            if kind == "text":
+                chunks.append(str(part.get("text") or ""))
+            elif kind in ("data", "file"):
+                attachments.append(part)
+        text = "\n".join(x.strip() for x in chunks if x.strip()).strip()
+        err = policy.check_limits(text)
+        if err:
+            return {"message": err}, rpc.ERR_INVALID_PARAMS
+        task_id = new_id()
+        ctx = str(msg.get("contextId") or "") or new_id(4)
+        self.db.create_task(task_id=task_id, owner=owner, direction="a2a", ctx=ctx, hops=1,
+                            src="a2a-client", dst=to_alias, text=text, status="submitted",
+                            attachments=json.dumps(attachments, ensure_ascii=False))
+        preview = text.replace("\n", " ")[:300] or "(без текста)"
+        ok, res = self.tg.send(owner, f"🌐 Внешний A2A-клиент → «{to_alias}»?\n\n{preview}\n\n"
+                                      f"· задача {task_id} · ctx {ctx}",
+                               [[("Отправить", f"hub:ok:{task_id}"),
+                                 ("Отклонить", f"hub:no:{task_id}")]])
+        if ok and isinstance(res, dict):
+            self.db.update_task(task_id, card_chat=owner, card_msg=res.get("message_id"))
+        self.db.event("a2a_parked", task_id=task_id, owner=owner, dst=to_alias, length=len(text))
+        return {"task": rpc.task_view(self.db.task(task_id))}, 0
+
     def on_reply(self, bot: Any, env: Dict[str, Any]) -> None:
         owner = int(bot["owner_tg"])
         task = self.db.task(str(env.get("task") or ""))
@@ -654,6 +740,22 @@ class Hub:
             return self.say(int(bot["bot_id"]), "Задача не найдена.")
         verdict = str(env.get("verdict") or "done").lower()
         text = str(env.get("text") or "").strip()
+
+        if self._is_a2a_task(task):
+            if verdict == "skip":
+                self.db.update_task(task["task_id"], status="skipped")
+                self.db.event("a2a_skipped", task_id=task["task_id"], owner=owner)
+            elif verdict == "ask":
+                question = str(env.get("question") or text or "").strip()[:1500]
+                self.db.update_task(task["task_id"], status="input-required", question=question)
+                self.db.event("a2a_input_required", task_id=task["task_id"], owner=owner)
+                self.tg.send(owner, f"🌐 Клиент ждёт ответа от «{task['dst_alias']}»:\n\n"
+                                    f"{question}\n\nОтветьте текстом.")
+            else:
+                self.db.update_task(task["task_id"], status="completed", answer=text)
+                self.db.event("a2a_answered", task_id=task["task_id"], owner=owner,
+                              length=len(text))
+            return
         if verdict == "skip":
             self.db.update_task(task["task_id"], status="skipped")
             self.db.event("task_skipped", task_id=task["task_id"], owner=owner)
@@ -1184,6 +1286,15 @@ def main() -> int:
               open_registration=open_reg, proxy=proxy)
     print(f"hub: db={db_path} owners={sorted(hub.owners)} proxy={'yes' if proxy else 'no'}",
           flush=True)
+    a2a_port = int(os.environ.get("TG_GATEWAY_A2A_PORT") or 0)
+    if a2a_port:
+        from . import a2a_http
+        a2a_http.start(hub, port=a2a_port,
+                       token=(os.environ.get("TG_GATEWAY_A2A_TOKEN") or "").strip() or None,
+                       host=(os.environ.get("TG_GATEWAY_A2A_HOST") or "127.0.0.1").strip())
+        print(f"hub: A2A http на :{a2a_port} (Bearer "
+              f"{'включён' if os.environ.get('TG_GATEWAY_A2A_TOKEN') else 'выключен'})",
+              flush=True)
     if hub.install_commands():
         print("hub: команды опубликованы в Telegram (автодополнение включено)", flush=True)
     hub.run()

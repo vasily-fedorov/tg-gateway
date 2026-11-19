@@ -60,6 +60,47 @@ bash deploy/install.sh     # user-unit tg-gateway-hub
 Боту в @BotFather нужны: **Bot-to-Bot Communication Mode** и членство в одной группе с
 ботами-агентами (Telegram открывает bot-to-bot DM только при общем чате).
 
+## A2A по HTTP (прокси для стандартных клиентов)
+
+Сам хаб живёт в Telegram и URL не имеет. Чтобы к нему мог подключиться обычный
+A2A-клиент (Hermes `a2a_call`, Google ADK, LangChain), хаб поднимает локальный
+HTTP-фронт — тот же код, тот же процесс, та же БД:
+
+```
+A2A client ──HTTP/JSON-RPC──▶ hub :18765 ──карточка──▶ владелец ──клик──▶ бот (Telegram)
+```
+
+Включается переменными:
+
+```
+TG_GATEWAY_A2A_PORT=18765          # 0 = выключено
+TG_GATEWAY_A2A_HOST=127.0.0.1      # наружу — только через nginx + TLS
+TG_GATEWAY_A2A_TOKEN=<bearer>      # без него фронт отвечает 401
+```
+
+Что поддерживается:
+
+- `GET /.well-known/agent-card.json` (и алиас `agent.json`) — карточка хаба, боты = skills;
+- `POST /` JSON-RPC: `message/send`, `tasks/get`, `tasks/list`, `tasks/cancel`,
+  `agent/card`, `agent/protocol`;
+- `GET /health`.
+
+Честные ограничения: `message/send` **всегда асинхронный** — владелец подтверждает
+карточку, поэтому клиент получает Task в состоянии `auth-required` и дальше поллит
+`tasks/get`. Стриминга и push-вебхуков нет (`capabilities.streaming/pushNotifications =
+false`). Один токен = один владелец (его боты и маршруты).
+
+Пример:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://127.0.0.1:18765/.well-known/agent-card.json
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"message/send",
+       "params":{"to":"aa","message":{"parts":[{"kind":"text","text":"сколько места на /?"}]}}}' \
+  http://127.0.0.1:18765/
+```
+
 ## Тесты
 
 ```bash

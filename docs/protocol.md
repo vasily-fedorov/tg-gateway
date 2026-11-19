@@ -155,7 +155,21 @@ auth-required ──клик владельца──▶ working ──▶ compl
   мы допускаем DM-транспорт (у них только группы, `chat_id < 0`).
 - Совместимость с внешними A2A-агентами **не заявляется** и не поддерживается.
 
-## 8. Аудит
+## 8. HTTP-фронт для внешних A2A-клиентов
+
+Транспорт Telegram остаётся основным, но хаб умеет поднимать локальный A2A-сервер
+(`hub/a2a_http.py`), чтобы к нему подключались стандартные A2A-клиенты:
+
+- `GET /.well-known/agent-card.json` — карточка хаба (боты = skills);
+- JSON-RPC `message/send` → задача создаётся в состоянии `auth-required` (нужна
+  карточка владельцу), `tasks/get` / `tasks/list` / `tasks/cancel` — как обычно;
+- авторизация: `Authorization: Bearer <TG_GATEWAY_A2A_TOKEN>`, биндинг по умолчанию
+  127.0.0.1 (наружу — только через nginx с TLS);
+- источник задачи помечается `src_alias = "a2a-client"`: ответ бота не порождает новую
+  задачу боту, а закрывает задачу клиента (artifact в `tasks/get`);
+- ограничения: `streaming=false`, `pushNotifications=false`, один токен = один владелец.
+
+## 9. Аудит
 
 Хаб: таблица `events` (`relay_parked`, `card_approved`, `delivered`, `reply_parked`,
 `task_skipped`, `ttl_rejected`, `rpc_dedup`, `rpc_dedup_fingerprint`, `hop_limit`,

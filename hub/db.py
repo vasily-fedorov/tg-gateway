@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sqlite3
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -109,33 +110,43 @@ class Db:
     def __init__(self, path: pathlib.Path | str):
         self.path = pathlib.Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path), timeout=10, isolation_level=None)
+        # HTTP-фронт A2A работает в другом потоке — соединение должно быть
+        # доступно из любого потока, а доступ сериализуется замком.
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(str(self.path), timeout=10, isolation_level=None,
+                                    check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
+        self.run("PRAGMA journal_mode=WAL")
+        self.run("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
         self._migrate()
 
     def _migrate(self) -> None:
         tcols = {r["name"] for r in self.q("PRAGMA table_info(tasks)")}
         if "attachments" not in tcols:
-            self.conn.execute("ALTER TABLE tasks ADD COLUMN attachments TEXT")
+            self.run("ALTER TABLE tasks ADD COLUMN attachments TEXT")
         cols = {r["name"] for r in self.q("PRAGMA table_info(bots)")}
         if "description" not in cols:
-            self.conn.execute("ALTER TABLE bots ADD COLUMN description TEXT NOT NULL DEFAULT ''")
-        self.conn.execute(
+            self.run("ALTER TABLE bots ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+        self.run(
             "CREATE TABLE IF NOT EXISTS inbox_msgs (message_id TEXT PRIMARY KEY, task_id TEXT, "
             "created_at REAL NOT NULL)")
         cols = {r["name"] for r in self.q("PRAGMA table_info(inbox_msgs)")}
         if "fingerprint" not in cols:
-            self.conn.execute("ALTER TABLE inbox_msgs ADD COLUMN fingerprint TEXT")
-        self.conn.execute(
+            self.run("ALTER TABLE inbox_msgs ADD COLUMN fingerprint TEXT")
+        self.run(
             "CREATE TABLE IF NOT EXISTS peer_health (alias TEXT PRIMARY KEY, failures INTEGER NOT NULL "
             "DEFAULT 0, blocked_until REAL NOT NULL DEFAULT 0, last_error TEXT, updated_at REAL NOT NULL)")
 
     # ── helpers ──────────────────────────────────────────────────────────────
+    def run(self, sql: str, args: tuple = ()) -> sqlite3.Cursor:
+        """Запись/DDL под замком (безопасно из другого потока)."""
+        with self._lock:
+            return self.conn.execute(sql, args)
+
     def q(self, sql: str, args: tuple = ()) -> List[sqlite3.Row]:
-        return list(self.conn.execute(sql, args))
+        with self._lock:
+            return list(self.run(sql, args))
 
     def one(self, sql: str, args: tuple = ()) -> Optional[sqlite3.Row]:
         rows = self.q(sql, args)
@@ -143,26 +154,26 @@ class Db:
 
     def event(self, kind: str, *, task_id: str | None = None, owner: int | None = None,
               **detail: Any) -> None:
-        self.conn.execute(
+        self.run(
             "INSERT INTO events (ts, kind, task_id, owner_tg, detail) VALUES (?,?,?,?,?)",
             (now(), kind, task_id, owner, json.dumps(detail, ensure_ascii=False)[:2000]))
 
     # ── owners / bots ────────────────────────────────────────────────────────
     def ensure_owner(self, tg_id: int, name: str = "") -> None:
-        self.conn.execute("INSERT OR IGNORE INTO owners (tg_id, name, created_at) VALUES (?,?,?)",
+        self.run("INSERT OR IGNORE INTO owners (tg_id, name, created_at) VALUES (?,?,?)",
                           (tg_id, name, now()))
 
     def owner(self, tg_id: int) -> Optional[sqlite3.Row]:
         return self.one("SELECT * FROM owners WHERE tg_id=?", (tg_id,))
 
     def add_pair_code(self, owner: int, alias: str, code: str) -> None:
-        self.conn.execute("INSERT INTO pair_codes (code, owner_tg, alias, created_at) "
+        self.run("INSERT INTO pair_codes (code, owner_tg, alias, created_at) "
                           "VALUES (?,?,?,?)", (code.upper(), owner, alias, now()))
 
     def take_pair_code(self, code: str) -> Optional[sqlite3.Row]:
         row = self.one("SELECT * FROM pair_codes WHERE code=? AND used_at IS NULL", (code.upper(),))
         if row:
-            self.conn.execute("UPDATE pair_codes SET used_at=? WHERE code=?", (now(), code.upper()))
+            self.run("UPDATE pair_codes SET used_at=? WHERE code=?", (now(), code.upper()))
         return row
 
     def bot_owner(self, bot_id: int) -> int | None:
@@ -170,12 +181,12 @@ class Db:
         return int(row["owner_tg"]) if row else None
 
     def set_enabled(self, bot_id: int, enabled: bool) -> None:
-        self.conn.execute("UPDATE bots SET enabled=? WHERE bot_id=?", (1 if enabled else 0, bot_id))
+        self.run("UPDATE bots SET enabled=? WHERE bot_id=?", (1 if enabled else 0, bot_id))
 
     def pair_bot(self, *, bot_id: int, username: str, alias: str, owner: int,
                  kind: str = "agent") -> bool:
         """False — если бот уже принадлежит другому владельцу (нужен /unpair)."""
-        self.conn.execute(
+        self.run(
             "INSERT INTO bots (bot_id, username, alias, owner_tg, kind, enabled, paired_at) "
             "VALUES (?,?,?,?,?,1,?) "
             "ON CONFLICT(bot_id) DO UPDATE SET username=excluded.username, alias=excluded.alias, "
@@ -198,7 +209,7 @@ class Db:
         return row["task_id"] if row else None
 
     def remember_message(self, message_id: str, task_id: str, fingerprint: str = "") -> None:
-        self.conn.execute("INSERT OR REPLACE INTO inbox_msgs (message_id, task_id, created_at, "
+        self.run("INSERT OR REPLACE INTO inbox_msgs (message_id, task_id, created_at, "
                           "fingerprint) VALUES (?,?,?,?)", (message_id, task_id, now(), fingerprint))
 
     def seen_fingerprint(self, fingerprint: str, window_s: float = 300.0) -> Optional[str]:
@@ -211,13 +222,13 @@ class Db:
     def peer_state(self, alias: str) -> sqlite3.Row:
         row = self.one("SELECT * FROM peer_health WHERE alias=?", (alias,))
         if row is None:
-            self.conn.execute("INSERT INTO peer_health (alias, updated_at) VALUES (?,?)",
+            self.run("INSERT INTO peer_health (alias, updated_at) VALUES (?,?)",
                               (alias, now()))
             row = self.one("SELECT * FROM peer_health WHERE alias=?", (alias,))
         return row
 
     def peer_ok(self, alias: str) -> None:
-        self.conn.execute("UPDATE peer_health SET failures=0, blocked_until=0, last_error=NULL, "
+        self.run("UPDATE peer_health SET failures=0, blocked_until=0, last_error=NULL, "
                           "updated_at=? WHERE alias=?", (now(), alias))
 
     def peer_failed(self, alias: str, error: str, *, threshold: int = 3,
@@ -229,7 +240,7 @@ class Db:
         if failures >= threshold:
             blocked = now() + block_s
             failures = 0
-        self.conn.execute("UPDATE peer_health SET failures=?, blocked_until=?, last_error=?, "
+        self.run("UPDATE peer_health SET failures=?, blocked_until=?, last_error=?, "
                           "updated_at=? WHERE alias=?",
                           (failures, blocked, error[:200], now(), alias))
         return bool(blocked)
@@ -242,24 +253,24 @@ class Db:
         bot = self.bot_by_alias(owner, alias)
         if not bot:
             return False
-        self.conn.execute("UPDATE bots SET description=? WHERE bot_id=?",
+        self.run("UPDATE bots SET description=? WHERE bot_id=?",
                           (text[:300], int(bot["bot_id"])))
         return True
 
     # ── межвладельческие связи ───────────────────────────────────────────────
     def create_invite(self, bot_id: int, owner: int, code: str) -> None:
-        self.conn.execute("INSERT INTO invites (code, bot_id, owner_tg, created_at) "
+        self.run("INSERT INTO invites (code, bot_id, owner_tg, created_at) "
                           "VALUES (?,?,?,?)", (code.upper(), bot_id, owner, now()))
 
     def redeem_invite(self, code: str) -> Optional[sqlite3.Row]:
         row = self.one("SELECT * FROM invites WHERE code=? AND used_at IS NULL", (code.upper(),))
         if row:
-            self.conn.execute("UPDATE invites SET used_at=? WHERE code=?", (now(), code.upper()))
+            self.run("UPDATE invites SET used_at=? WHERE code=?", (now(), code.upper()))
         return row
 
     def add_link(self, src_bot_id: int, dst_bot_id: int, *, policy_src: str = "ask",
                  policy_dst: str = "ask") -> None:
-        self.conn.execute(
+        self.run(
             "INSERT INTO links (src_bot_id, dst_bot_id, policy_src, policy_dst, created_at) "
             "VALUES (?,?,?,?,?) ON CONFLICT(src_bot_id, dst_bot_id) DO UPDATE SET "
             "policy_src=excluded.policy_src, policy_dst=excluded.policy_dst",
@@ -284,7 +295,7 @@ class Db:
             "WHERE s.owner_tg=? OR d.owner_tg=? ORDER BY l.id", (owner, owner))
 
     def drop_link(self, link_id: int) -> None:
-        self.conn.execute("DELETE FROM links WHERE id=?", (link_id,))
+        self.run("DELETE FROM links WHERE id=?", (link_id,))
 
     def bot_by_username(self, username: str) -> Optional[sqlite3.Row]:
         return self.one("SELECT * FROM bots WHERE username=? AND enabled=1",
@@ -297,7 +308,7 @@ class Db:
 
     def set_route(self, owner: int, src: str, dst: str, *, policy: str = "ask",
                   max_text: int = 3000, per_hour: int = 20) -> None:
-        self.conn.execute(
+        self.run(
             "INSERT INTO routes (owner_tg, src_alias, dst_alias, policy, max_text, per_hour, "
             "created_at) VALUES (?,?,?,?,?,?,?) "
             "ON CONFLICT(owner_tg, src_alias, dst_alias) DO UPDATE SET policy=excluded.policy, "
@@ -305,7 +316,7 @@ class Db:
             (owner, src, dst, policy, max_text, per_hour, now()))
 
     def delete_route(self, owner: int, route_id: int) -> bool:
-        cur = self.conn.execute("DELETE FROM routes WHERE id=? AND owner_tg=?", (route_id, owner))
+        cur = self.run("DELETE FROM routes WHERE id=? AND owner_tg=?", (route_id, owner))
         return bool(cur.rowcount)
 
     def routes(self, owner: int) -> List[sqlite3.Row]:
@@ -314,7 +325,7 @@ class Db:
 
     # ── состояние диалога (inline-кнопки не умеют вводить текст) ─────────────
     def set_state(self, owner: int, action: str, payload: str = "") -> None:
-        self.conn.execute("INSERT INTO owner_state (owner_tg, action, payload, created_at) "
+        self.run("INSERT INTO owner_state (owner_tg, action, payload, created_at) "
                           "VALUES (?,?,?,?) ON CONFLICT(owner_tg) DO UPDATE SET "
                           "action=excluded.action, payload=excluded.payload, "
                           "created_at=excluded.created_at", (owner, action, payload, now()))
@@ -327,8 +338,8 @@ class Db:
         return row
 
     def clear_state(self, owner: int) -> None:
-        self.conn.execute("DELETE FROM owner_state WHERE owner_tg=?", (owner,))
-        self.conn.execute("DELETE FROM owner_state WHERE created_at < ?", (now() - 3600,))
+        self.run("DELETE FROM owner_state WHERE owner_tg=?", (owner,))
+        self.run("DELETE FROM owner_state WHERE created_at < ?", (now() - 3600,))
 
     # ── tasks ────────────────────────────────────────────────────────────────
     def create_task(self, *, task_id: str, owner: int, direction: str, ctx: str, hops: int,
@@ -336,7 +347,7 @@ class Db:
                     card_chat: int | None = None, card_msg: int | None = None,
                     attachments: str | None = None) -> None:
         ts = now()
-        self.conn.execute(
+        self.run(
             "INSERT INTO tasks (task_id, owner_tg, direction, ctx, hops, src_alias, dst_alias, "
             "text, status, card_chat, card_msg, created_at, updated_at, attachments) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -347,7 +358,7 @@ class Db:
         if not fields:
             return
         cols = ", ".join(f"{k}=?" for k in fields)
-        self.conn.execute(f"UPDATE tasks SET {cols}, updated_at=? WHERE task_id=?",
+        self.run(f"UPDATE tasks SET {cols}, updated_at=? WHERE task_id=?",
                           (*fields.values(), now(), task_id))
 
     def task(self, task_id: str) -> Optional[sqlite3.Row]:
