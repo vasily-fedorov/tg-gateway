@@ -1297,6 +1297,39 @@ def run() -> dict:
     assert completed["task"]["artifacts"][0]["artifactId"].endswith("-out")
     roles = [m["role"] for m in completed["task"]["history"]]
     assert roles == ["user", "agent"], roles
+    # приоритет: политика клиента сильнее политики бота (в обе стороны)
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.db.set_a2a_policy(OWNER, "aa", "auto")           # бот: без карточки
+    row, _t = hub.db.create_client(owner=OWNER, name="strict", bots='["aa"]', policy="ask")
+    cl = clientlib.as_client(hub.db.client(OWNER, row["client_id"]))
+    cards_before = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
+    out, code = hub.http_rpc("SendMessage", {"to": "aa",
+                                             "message": {"parts": [{"kind": "text",
+                                                                    "text": "строго"}]}}, client=cl)
+    assert code == 0 and out["task"]["status"]["state"] == "auth-required", out
+    assert len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]]) == cards_before + 1
+
+    hub.db.set_a2a_policy(OWNER, "aa", "ask")            # бот: карточка
+    hub.db.update_client(row["client_id"], policy="auto")  # клиент: сразу
+    cl = clientlib.as_client(hub.db.client(OWNER, row["client_id"]))
+    cards_before = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
+    out, code = hub.http_rpc("SendMessage", {"to": "aa",
+                                             "message": {"parts": [{"kind": "text",
+                                                                    "text": "быстро"}]}}, client=cl)
+    assert code == 0 and out["task"]["status"]["state"] in ("working", "completed"), out
+    assert len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]]) == cards_before
+    # inherit → берётся политика бота
+    hub.db.update_client(row["client_id"], policy="inherit")
+    cl = clientlib.as_client(hub.db.client(OWNER, row["client_id"]))
+    cards_before = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
+    out, _ = hub.http_rpc("SendMessage", {"to": "aa",
+                                          "message": {"parts": [{"kind": "text",
+                                                                 "text": "наследуй"}]}}, client=cl)
+    assert out["task"]["status"]["state"] == "auth-required"
+    assert len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]]) == cards_before + 1
+    res["a2a_policy_precedence"] = True
+
     res["a2a_native_wait"] = True
 
     # старый самодельный конверт больше не принимается
