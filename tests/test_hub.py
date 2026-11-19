@@ -14,7 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from hub import policy  # noqa: E402
+from hub import clients as clientlib  # noqa: E402
+from hub import policy, rpc  # noqa: E402
 from hub.app import Hub  # noqa: E402
 
 OWNER = 100000001
@@ -1016,6 +1017,117 @@ def run() -> dict:
     kinds = [x.get("kind") for x in third_payload["params"]["message"]["parts"]]
     assert "data" not in kinds, kinds
     res["a2a_context_thread"] = True
+
+    # 10v. внешние клиенты: токены, права, лимиты, изоляция задач
+    import urllib.error
+    import urllib.request
+    from hub import a2a_http
+
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    pair(hub, tg, bot_id=GOD, alias="god")
+
+    # мастер в меню: имя → клиент + одноразовый токен
+    hub.handle(cb(OWNER, "hub:new:client", message_id=60))
+    assert hub.db.get_state(OWNER)["action"] == "client_new"
+    hub.handle(msg(OWNER, "langchain-prod"))
+    tokens = [x["text"] for x in tg.sent if "показывается один раз" in x["text"]]
+    assert tokens and "tgw_" in tokens[-1], tokens[-5:]
+    row = hub.db.clients(OWNER)[0]
+    assert row["name"] == "langchain-prod" and row["token_prefix"].startswith("tgw_")
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='client_created'")
+
+    # права: клиенту разрешён только aa
+    hub.db.update_client(row["client_id"], bots='["aa"]')
+    cl = clientlib.as_client(hub.db.client(OWNER, row["client_id"]))
+    out, code = hub.http_rpc("SendMessage", {"to": "god",
+                                             "message": {"parts": [{"kind": "text",
+                                                                    "text": "влезть к god"}]}},
+                             client=cl)
+    assert code == rpc.ERR_FORBIDDEN_BOT, (code, out)
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='client_denied'")
+
+    out, code = hub.http_rpc("SendMessage", {"to": "aa",
+                                             "message": {"parts": [{"kind": "text",
+                                                                    "text": "первый"}]}},
+                             client=cl)
+    assert code == 0, out
+    task_id = out["task"]["id"]
+    assert hub.db.task(task_id)["client_id"] == row["client_id"]
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='a2a_parked'")
+
+    # изоляция: другой клиент этой же задачи не видит
+    row2, _ = hub.db.create_client(owner=OWNER, name="other", bots="*")
+    cl2 = clientlib.as_client(hub.db.client(OWNER, row2["client_id"]))
+    got, code = hub.http_rpc("GetTask", {"id": task_id}, client=cl2)
+    assert code == rpc.ERR_TASK_NOT_FOUND, got
+    listed, _ = hub.http_rpc("ListTasks", {}, client=cl2)
+    assert all(t["id"] != task_id for t in listed["tasks"])
+    # legacy-токен владельца видит всё
+    legacy, _ = hub.http_rpc("GetTask", {"id": task_id})
+    assert legacy["task"]["id"] == task_id
+
+    # лимит частоты: per_min=2 → третий запрос отклонён
+    hub.db.update_client(row["client_id"], per_min=2, per_hour=100)
+    cl = clientlib.as_client(hub.db.client(OWNER, row["client_id"]))
+    hub.http_rpc("SendMessage", {"to": "aa", "message": {"parts": [{"kind": "text",
+                                                                   "text": "второй"}]}}, client=cl)
+    out, code = hub.http_rpc("SendMessage", {"to": "aa",
+                                             "message": {"parts": [{"kind": "text",
+                                                                    "text": "третий"}]}},
+                             client=cl)
+    assert code == rpc.ERR_RATE_LIMITED, (code, out)
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='client_rate_limited'")
+
+    # политика клиента переопределяет бота: auto → доставка без карточки
+    hub.db.update_client(row["client_id"], policy="auto", per_min=10)
+    cl = clientlib.as_client(hub.db.client(OWNER, row["client_id"]))
+    cards_before = len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]])
+    out, code = hub.http_rpc("SendMessage", {"to": "aa",
+                                             "message": {"parts": [{"kind": "text",
+                                                                    "text": "авто"}]}}, client=cl)
+    assert code == 0 and out["task"]["status"]["state"] in ("working", "completed"), out
+    assert len([x for x in tg.sent if x["chat"] == OWNER and x["buttons"]]) == cards_before
+
+    # HTTP: токен клиента работает, отозванный и старый — 401
+    row3, token3 = hub.db.create_client(owner=OWNER, name="http-client", bots="*", policy="auto")
+    server = a2a_http.start(hub, port=0, token="legacy-token")
+    try:
+        port = server.server_address[1]
+
+        def post(token_value):
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/bot/aa/", method="POST",
+                data=json.dumps({"jsonrpc": "2.0", "id": 7, "method": "SendMessage",
+                                 "params": {"message": {"parts": [{"kind": "text",
+                                                                   "text": "из http"}]}}}).encode(),
+                headers={"Authorization": f"Bearer {token_value}",
+                         "Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return json.load(r)
+
+        reply = post(token3)
+        assert reply["result"]["task"]["id"], reply
+        assert hub.db.client(OWNER, row3["client_id"])["last_seen_at"]
+
+        new_token = hub.db.rotate_client_token(OWNER, row3["client_id"])
+        try:
+            post(token3)
+            raise AssertionError("старый токен должен давать 401")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, exc.code
+        assert post(new_token)["result"]["task"]["id"]
+
+        hub.db.revoke_client(OWNER, row3["client_id"])
+        try:
+            post(new_token)
+            raise AssertionError("отозванный клиент должен давать 401")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 401, exc.code
+        assert hub.db.q("SELECT 1 FROM events WHERE kind='client_denied' AND detail LIKE '%revoked%'")
+    finally:
+        server.shutdown()
+    res["clients_tokens_limits"] = True
 
     # старый самодельный конверт больше не принимается
     hub, tg = new_hub()

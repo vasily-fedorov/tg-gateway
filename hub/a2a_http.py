@@ -16,10 +16,13 @@ HTTP/JSON-RPC в те же операции хаба:
 from __future__ import annotations
 
 import json
+import secrets as _secrets
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 
+from . import clients as clientlib
 from . import rpc
 
 A2A_SRC = "a2a-client"
@@ -41,11 +44,38 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _auth_ok(self) -> bool:
-        if not self.token:
-            return True
+    def _resolve_client(self):
+        """(вид, клиент): ('legacy', None) / ('client', dict) / (None, None) — отказ.
+
+        Legacy-токен (TG_GATEWAY_A2A_TOKEN) остаётся правами владельца; клиентские
+        токены `tgw_<client_id>_<secret>` дают свои боты, политику и лимиты.
+        """
         header = self.headers.get("Authorization", "")
-        return header == f"Bearer {self.token}"
+        if not header.lower().startswith("bearer "):
+            return (None, None)
+        token = header[7:].strip()
+        if not token:
+            return (None, None)
+        if self.token and _secrets.compare_digest(token, self.token):
+            return ("legacy", None)
+        if not self.token and not self.hub.db.q("SELECT 1 FROM clients LIMIT 1"):
+            return ("legacy", None)          # фронт без токена и без клиентов — открытый локально
+        row = self.hub.db.client_by_hash(clientlib.token_hash(token))
+        if not row:
+            return (None, None)
+        client = clientlib.as_client(row)
+        if not int(client.get("enabled") or 0) or client.get("revoked_at"):
+            self.hub.db.event("client_denied", client=client["client_id"], reason="revoked")
+            return (None, None)
+        expires_at = client.get("expires_at")
+        if expires_at and float(expires_at) < time.time():
+            self.hub.db.event("client_denied", client=client["client_id"], reason="expired")
+            return (None, None)
+        return ("client", client)
+
+    def _auth_ok(self) -> bool:
+        kind, _ = self._resolve_client()
+        return kind is not None
 
     def _body(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         try:
@@ -106,7 +136,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ── POST: JSON-RPC ───────────────────────────────────────────────────────
     def do_POST(self) -> None:  # noqa: N802
-        if not self._auth_ok():
+        kind, client = self._resolve_client()
+        if kind is None:
             return self._send(401, {"error": "unauthorized"})
         payload, err = self._body()
         if err:
@@ -117,8 +148,12 @@ class _Handler(BaseHTTPRequestHandler):
         alias = self._alias()
         if alias and isinstance(params, dict):
             params.setdefault("to", alias)
+        if client:
+            self.hub.db.touch_client(str(client["client_id"]))
+            client["last_method"] = method
         try:
-            result, code = self.hub.http_rpc(method, params)
+            result, code = self.hub.http_rpc(method, params,
+                                             client=client if kind == "client" else None)
         except Exception as exc:  # noqa: BLE001
             return self._send(200, json.loads(rpc.rpc_err(rpc_id, rpc.ERR_INTERNAL,
                                                           f"{type(exc).__name__}: {exc}")))

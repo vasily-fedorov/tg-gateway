@@ -47,6 +47,24 @@ CREATE TABLE IF NOT EXISTS routes (
     created_at  REAL NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS routes_pair ON routes(owner_tg, src_alias, dst_alias);
+CREATE TABLE IF NOT EXISTS clients (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_id   TEXT NOT NULL UNIQUE,
+    owner_tg    INTEGER NOT NULL,
+    name        TEXT NOT NULL DEFAULT '',
+    token_hash  TEXT NOT NULL UNIQUE,
+    token_prefix TEXT NOT NULL DEFAULT '',
+    bots        TEXT NOT NULL DEFAULT '*',
+    policy      TEXT NOT NULL DEFAULT 'inherit',
+    max_text    INTEGER NOT NULL DEFAULT 4000,
+    per_min     INTEGER NOT NULL DEFAULT 10,
+    per_hour    INTEGER NOT NULL DEFAULT 200,
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    expires_at  REAL,
+    created_at  REAL NOT NULL,
+    last_seen_at REAL,
+    revoked_at  REAL
+);
 CREATE TABLE IF NOT EXISTS tasks (
     task_id     TEXT PRIMARY KEY,
     owner_tg    INTEGER NOT NULL,
@@ -126,6 +144,8 @@ class Db:
         tcols = {r["name"] for r in self.q("PRAGMA table_info(tasks)")}
         if "attachments" not in tcols:
             self.run("ALTER TABLE tasks ADD COLUMN attachments TEXT")
+        if "client_id" not in tcols:
+            self.run("ALTER TABLE tasks ADD COLUMN client_id TEXT")
         cols = {r["name"] for r in self.q("PRAGMA table_info(bots)")}
         if "description" not in cols:
             self.run("ALTER TABLE bots ADD COLUMN description TEXT NOT NULL DEFAULT ''")
@@ -362,18 +382,78 @@ class Db:
         self.run("DELETE FROM owner_state WHERE owner_tg=?", (owner,))
         self.run("DELETE FROM owner_state WHERE created_at < ?", (now() - 3600,))
 
+    # ── внешние A2A-клиенты ──────────────────────────────────────────────────
+    def create_client(self, *, owner: int, name: str, bots: str = "*",
+                      policy: str = "inherit", max_text: int = 4000, per_min: int = 10,
+                      per_hour: int = 200, expires_at: float | None = None) -> tuple:
+        from . import clients as tokenlib
+        client_id = tokenlib.new_client_id()
+        token = tokenlib.new_token(client_id)
+        self.run("INSERT INTO clients (client_id, owner_tg, name, token_hash, token_prefix, "
+                 "bots, policy, max_text, per_min, per_hour, enabled, expires_at, created_at) "
+                 "VALUES (?,?,?,?,?,?,?,?,?,?,1,?,?)",
+                 (client_id, owner, name.strip()[:60], tokenlib.token_hash(token),
+                  tokenlib.token_prefix(token), bots, policy, int(max_text), int(per_min),
+                  int(per_hour), expires_at, now()))
+        return self.one("SELECT * FROM clients WHERE client_id=?", (client_id,)), token
+
+    def clients(self, owner: int) -> list:
+        return self.q("SELECT * FROM clients WHERE owner_tg=? ORDER BY created_at", (owner,))
+
+    def client(self, owner: int, client_id: str) -> Optional[sqlite3.Row]:
+        return self.one("SELECT * FROM clients WHERE owner_tg=? AND client_id=?", (owner, client_id))
+
+    def client_by_hash(self, hashed: str) -> Optional[sqlite3.Row]:
+        return self.one("SELECT * FROM clients WHERE token_hash=?", (hashed,))
+
+    def update_client(self, client_id: str, **fields: Any) -> bool:
+        allowed = {"name", "bots", "policy", "max_text", "per_min", "per_hour",
+                   "enabled", "expires_at", "revoked_at"}
+        data = {k: v for k, v in fields.items() if k in allowed}
+        if not data:
+            return False
+        sets = ", ".join(f"{k}=?" for k in data)
+        self.run(f"UPDATE clients SET {sets} WHERE client_id=?", (*data.values(), client_id))
+        return True
+
+    def rotate_client_token(self, owner: int, client_id: str) -> Optional[str]:
+        from . import clients as tokenlib
+        row = self.client(owner, client_id)
+        if not row:
+            return None
+        token = tokenlib.new_token(str(row["client_id"]))
+        self.run("UPDATE clients SET token_hash=?, token_prefix=? WHERE client_id=?",
+                 (tokenlib.token_hash(token), tokenlib.token_prefix(token), client_id))
+        return token
+
+    def revoke_client(self, owner: int, client_id: str) -> bool:
+        row = self.client(owner, client_id)
+        if not row:
+            return False
+        self.run("UPDATE clients SET enabled=0, revoked_at=? WHERE client_id=?",
+                 (now(), client_id))
+        return True
+
+    def touch_client(self, client_id: str) -> None:
+        self.run("UPDATE clients SET last_seen_at=? WHERE client_id=?", (now(), client_id))
+
+    def client_task_count(self, client_id: str, window_s: float) -> int:
+        row = self.one("SELECT COUNT(*) AS n FROM tasks WHERE client_id=? AND created_at > ?",
+                       (client_id, now() - float(window_s)))
+        return int(row["n"]) if row else 0
+
     # ── tasks ────────────────────────────────────────────────────────────────
     def create_task(self, *, task_id: str, owner: int, direction: str, ctx: str, hops: int,
                     src: str, dst: str, text: str, status: str = "submitted",
                     card_chat: int | None = None, card_msg: int | None = None,
-                    attachments: str | None = None) -> None:
+                    attachments: str | None = None, client_id: str | None = None) -> None:
         ts = now()
         self.run(
             "INSERT INTO tasks (task_id, owner_tg, direction, ctx, hops, src_alias, dst_alias, "
-            "text, status, card_chat, card_msg, created_at, updated_at, attachments) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "text, status, card_chat, card_msg, created_at, updated_at, attachments, client_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (task_id, owner, direction, ctx, hops, src, dst, text, status, card_chat, card_msg,
-             ts, ts, attachments))
+             ts, ts, attachments, client_id))
 
     def update_task(self, task_id: str, **fields: Any) -> None:
         if not fields:

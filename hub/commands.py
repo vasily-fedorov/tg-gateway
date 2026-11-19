@@ -33,7 +33,8 @@ COMMANDS: List[Tuple[str, str]] = [
 MENU_ROWS: List[List[Tuple[str, str]]] = [
     [("🤖 Боты", "hub:menu:bots"), ("🔀 Маршруты", "hub:menu:routes")],
     [("📜 Задачи", "hub:menu:log"), ("📘 Протокол", "hub:menu:protocol")],
-    [("🔗 Связи", "hub:menu:links"), ("❓ Помощь", "hub:menu:help")],
+    [("🔗 Связи", "hub:menu:links"), ("🔑 Клиенты", "hub:menu:clients")],
+    [("❓ Помощь", "hub:menu:help")],
 ]
 
 
