@@ -12,8 +12,6 @@
 | `hub/rpc.py` | A2A-объекты (Task/TaskStatus/Part/AgentCard), коды ошибок, маппинг состояний. |
 | `hub/policy.py` | лимиты, hops, фильтры секретов, TTL, отпечаток содержимого. |
 | `hub/protocol.py` | текст протокола для агента (`/protocol`, RPC `agent/protocol`). |
-| `hub/a2a_http.py` | HTTP-фронт A2A: agent card, JSON-RPC, Bearer, пути `/bot/<alias>`. |
-| `hub/clients.py` | токены клиентов: генерация, sha256, права (`bots`, `*`). |
 | `hub/tg.py` | Bot API (long polling, send/edit/callback, прокси). |
 | `docs/protocol.md` | **контракт** (Telegram + HTTP). Меняется — версия протокола меняется. |
 | `tests/test_hub.py` | единственный набор тестов хаба (группы `res[...]`). |
