@@ -648,6 +648,8 @@ class Hub:
                             "contextId": task["ctx"], "parts": parts},
                 "metadata": {"task": task_id, "hops": hops, "from": task["src_alias"],
                              "sent_at": self.clock(), "contextTurns": len(turns),
+                             # ответ на задачу: endpoint не должен снова запускать ход
+                             "kind": "answer" if str(task["direction"]) == "reply" else "request",
                              "protocolVersion": rpc.PROTOCOL_VERSION},
             },
         }

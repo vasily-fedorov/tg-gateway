@@ -1332,6 +1332,38 @@ def run() -> dict:
 
     res["a2a_native_wait"] = True
 
+    # 10z. ответ помечается metadata.kind=answer — endpoint не запускает новый ход
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    pair(hub, tg, bot_id=GOD, alias="god")
+    hub.db.set_route(OWNER, "aa", "god", policy="auto")   # продолжения без карточки
+    hub.db.set_route(OWNER, "god", "aa", policy="auto")   # ответы тоже без карточки
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "r-q", "method": "message/send",
+                                   "params": {"to": "god",
+                                              "message": {"role": "user", "messageId": "m-q",
+                                                          "parts": [{"kind": "text",
+                                                                     "text": "сколько места?"}]}}}),
+                   is_bot=True, username="aa"))
+    task_id = hub.db.q("SELECT task_id FROM tasks ORDER BY created_at DESC LIMIT 1")[0]["task_id"]
+    hub.handle(cb(OWNER, f"hub:ok:{task_id}"))            # карточку подтвердил владелец
+    requests = [json.loads(x["text"]) for x in tg.sent
+                if x["chat"] == GOD and x["text"].startswith("{")]
+    assert requests and requests[-1]["params"]["metadata"]["kind"] == "request", requests[-1]
+
+    hub.handle(msg(GOD, json.dumps({"jsonrpc": "2.0", "id": "u-ans", "method": "tasks/update",
+                                    "params": {"task": task_id,
+                                               "status": {"state": "completed"},
+                                               "artifact": {"parts": [{"kind": "text",
+                                                                       "text": "21 ГБ"}]}}}),
+                   is_bot=True, username="god"))
+    payloads = [json.loads(x["text"]) for x in tg.sent
+                if x["chat"] == AA and x["text"].startswith("{")]
+    payloads = [p for p in payloads if p.get("method") == "message/send"]
+    assert payloads, "ответ должен вернуться инициатору"
+    assert payloads[-1]["params"]["metadata"]["kind"] == "answer", payloads[-1]["params"]["metadata"]
+    assert payloads[-1]["params"]["message"]["parts"][0]["text"] == "21 ГБ"
+    res["a2a_answer_marked"] = True
+
     # старый самодельный конверт больше не принимается
     hub, tg = new_hub()
     pair(hub, tg, bot_id=GOD, alias="god")
