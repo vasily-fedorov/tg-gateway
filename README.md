@@ -1,7 +1,8 @@
 # tg-gateway — хаб межагентного обмена
 
 Telegram-бот, который держит маршруты, подтверждения владельца и состояние задач между
-агентами. Плагин агента (Hermes) живёт отдельно: `../hermes-tg-gateway`.
+агентами. Плагин агента (Hermes) живёт отдельно:
+[`hermes-tg-gateway`](https://github.com/vasily-fedorov/hermes-tg-gateway).
 
 ```
  агент A ─JSON-RPC─▶ хаб ─карточка─▶ владелец ─клик─▶ хаб ─JSON-RPC─▶ агент B
@@ -21,7 +22,11 @@ Telegram-бот, который держит маршруты, подтверж�
 - лимиты (`max_text`, `per_hour`), глубина цепочки (hops ≤ 3), TTL конверта 300 с, дедуп по `messageId` и по отпечатку содержимого;
 - здоровье пиров: 3 неудачные доставки → блокировка на 5 минут;
 - мультитенантность: у каждого владельца свои боты, маршруты, задачи, аудит; связи между владельцами — `/share` + `/link` с подтверждением с двух сторон;
-- части сообщения: `text`, `data` (JSON), `file` (только ссылка, бинарь не передаётся).
+- части сообщения: `text`, `data` (JSON), `file` (только ссылка, бинарь не передаётся);
+- **внешние A2A-клиенты**: HTTP-фронт с agent card, `message/send`, `tasks/*`, токены
+  клиентов с правами на ботов, лимитами и сроком действия (см. ниже);
+- **контекст ветки**: задачи с одним `contextId` образуют ветку, получателю передаётся
+  выжимка предыдущих ходов (5 ходов × 240 символов, отключается на маршруте).
 
 ## Команды владельца (в ЛС с ботом-хабом)
 
@@ -38,6 +43,9 @@ Telegram-бот, который держит маршруты, подтверж�
 /share <алиас>               приглашение для связи с чужим владельцем
 /link <код> <мой_алиас>      связать своего бота с чужим
 /links, /unlink <id>         список и разрыв связей
+/clients                     внешние A2A-клиенты: токены, права, лимиты, срок
+/client <cl_xxxxxx>          карточка клиента
+/token <cl_xxxxxx>           ротация токена клиента
 /cancel <id>, /unpair <алиас>
 /help
 ```
@@ -52,6 +60,13 @@ TG_GATEWAY_OWNERS=<tg_id владельца>
 TG_GATEWAY_OPEN=0          # 1 — разрешить самостоятельную регистрацию владельцев
 TG_GATEWAY_DB=/home/<user>/tg-gateway/hub.sqlite3
 TG_GATEWAY_PROXY=<http-прокси>  # если до api.telegram.org нужен прокси
+# опционально — HTTP-фронт для внешних A2A-клиентов:
+TG_GATEWAY_A2A_PORT=18765          # 0 = выключен
+TG_GATEWAY_A2A_HOST=127.0.0.1      # наружу — через nginx + TLS
+TG_GATEWAY_A2A_TOKEN=<bearer>      # legacy-токен владельца
+TG_GATEWAY_A2A_PUBLIC_URL=https://a2a.example.com
+TG_GATEWAY_A2A_WAIT=75             # сколько ждать клика/ответа в message/send
+TG_GATEWAY_A2A_PUBLIC_CARD=0       # 1 — карточка читается без токена (список агентов пуст)
 EOF
 chmod 600 ~/tg-gateway/.env
 bash deploy/install.sh     # user-unit tg-gateway-hub
@@ -94,7 +109,7 @@ A2A client ──HTTP/JSON-RPC──▶ hub :18765 ──карточка──�
 TG_GATEWAY_A2A_PORT=18765          # 0 = выключено
 TG_GATEWAY_A2A_HOST=127.0.0.1      # наружу — только через nginx + TLS
 TG_GATEWAY_A2A_TOKEN=<bearer>      # без него фронт отвечает 401
-TG_GATEWAY_A2A_WAIT=25             # сколько ждать клика владельца внутри message/send
+TG_GATEWAY_A2A_WAIT=75             # сколько ждать клика/ответа внутри message/send
 TG_GATEWAY_A2A_PUBLIC_URL=https://a2a.example.com   # что писать в карточке (за nginx)
 ```
 

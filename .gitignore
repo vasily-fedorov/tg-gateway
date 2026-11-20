@@ -7,3 +7,10 @@ gateway-routes.json
 
 # служебное состояние агента
 .omo/
+
+# секреты и рабочее состояние хаба
+.env
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+hub_id

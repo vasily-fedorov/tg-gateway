@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/user/workspace/tg-gateway
-EnvironmentFile=/home/user/tg-gateway/.env
+WorkingDirectory=%h/workspace/tg-gateway
+EnvironmentFile=%h/tg-gateway/.env
 ExecStart=/usr/bin/python3 -m hub.app
 Restart=always
 RestartSec=5

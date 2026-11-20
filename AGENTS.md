@@ -1,7 +1,7 @@
 # AGENTS.md — хаб tg-gateway
 
 Сервис-бот: маршруты, карточки владельца, состояние задач, аудит. Плагин агента живёт в
-`../hermes-tg-gateway` — здесь его кода нет.
+[`hermes-tg-gateway`](https://github.com/vasily-fedorov/hermes-tg-gateway) — здесь его кода нет.
 
 ## Структура
 
@@ -12,8 +12,11 @@
 | `hub/rpc.py` | A2A-объекты (Task/TaskStatus/Part/AgentCard), коды ошибок, маппинг состояний. |
 | `hub/policy.py` | лимиты, hops, фильтры секретов, TTL, отпечаток содержимого. |
 | `hub/protocol.py` | текст протокола для агента (`/protocol`, RPC `agent/protocol`). |
+| `hub/a2a_http.py` | HTTP-фронт A2A: agent card, JSON-RPC, Bearer, пути `/bot/<alias>`. |
+| `hub/clients.py` | токены клиентов: генерация, sha256, права (`bots`, `*`). |
 | `hub/tg.py` | Bot API (long polling, send/edit/callback, прокси). |
-| `docs/protocol.md` | **контракт** с плагином. Меняется — версия протокола меняется. |
+| `docs/protocol.md` | **контракт** (Telegram + HTTP). Меняется — версия протокола меняется. |
+| `tests/test_hub.py` | единственный набор тестов хаба (группы `res[...]`). |
 | `deploy/` | systemd user-unit + `install.sh`. |
 
 ## Проверка перед коммитом
@@ -35,6 +38,14 @@ python3 -c "import ast; ast.parse(open('hub/app.py').read())"
 8. **Аудит** каждого решения; hash/длины, не текст.
 9. **Совместимость**: меняешь поля в `docs/protocol.md` → поднимай `PROTOCOL_VERSION`
    (в `hub/rpc.py`) и синхронно обновляй плагин в `hermes-tg-gateway`.
+10. **Политика A2A**: `clients.policy` → `bots.a2a_policy` → `TG_GATEWAY_A2A_POLICY` → `ask`.
+    Клиент со `auto` не спрашивает владельца, но лимиты, фильтры и глубина действуют.
+11. **`artifacts` — результат**: ответ агента лежит в `artifacts[0]`, вход и ответ —
+    в `history` (так его читает клиент Hermes).
+12. **Discovery закрыт**: аноним получает 401; с токеном клиента видны только его боты;
+    `TG_GATEWAY_A2A_PUBLIC_CARD=1` не раскрывает список агентов.
+13. **Изоляция клиентов**: `tasks.client_id` — `GetTask`/`CancelTask`/`ListTasks` чужих
+    задач не видят; отзыв и ротация токена действуют сразу (401).
 
 ## Грабли Telegram
 

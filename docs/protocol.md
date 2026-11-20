@@ -1,9 +1,15 @@
 # tg-gateway protocol v1
 
-Транспорт — **Telegram DM** (бот-хаб ↔ бот-агент). Контракт — **JSON-RPC 2.0** с
-объектами в духе A2A v1.0. Публичного HTTP нет: чтобы подключить бота с другого хоста,
-достаточно добавить его в общую супергруппу с хабом (Telegram открывает bot-to-bot DM
-только при общем чате), включить Bot-to-Bot Mode и привязать одноразовым кодом.
+Основной транспорт — **Telegram DM** (бот-хаб ↔ бот-агент). Контракт — **JSON-RPC 2.0**
+с объектами в духе A2A v1.0. Плагин агента живёт отдельно (`hermes-tg-gateway`).
+
+Дополнительно хаб умеет поднимать **HTTP-фронт** для стандартных A2A-клиентов
+(`hub/a2a_http.py`, §8): тот же контракт, но по HTTPS с Bearer-токеном. Telegram при этом
+остаётся основным транспортом, а HTTP — опциональный вход.
+
+Чтобы подключить бота с другого хоста через Telegram, достаточно добавить его в общую
+супергруппу с хабом (Telegram открывает bot-to-bot DM только при общем чате), включить
+Bot-to-Bot Mode и привязать одноразовым кодом.
 
 Формальная часть ниже — источник истины для реализации. Расхождение кода и этой
 спеки считается багом.
@@ -28,7 +34,8 @@
 
 Ответ: `result` либо `error{code,message}`. Коды: `-32700` parse, `-32600` invalid
 request, `-32601` method not found, `-32602` invalid params, `-32603` internal,
-`-32001` task not found, `-32002` task not cancelable.
+`-32001` task not found, `-32002` task not cancelable, `-32003` бот не разрешён клиенту,
+`-32004` unauthorized, `-32005` лимит частоты клиента.
 
 ### Общие правила доставки
 
@@ -57,7 +64,27 @@ request, `-32601` method not found, `-32602` invalid params, `-32603` internal,
 
 `to` — локальный алиас или `@username` бота, связанного через `/share` + `/link`
 (межвладельческая связь). Итог: `result.task` — Task в состоянии `auth-required`
-(ждём карточку владельца) либо `working` (политика `auto` для продолжения).
+(ждём карточку владельца) либо сразу `working`, если подтверждение не требуется.
+
+Нужно ли подтверждение — решается по цепочке (первое совпадение):
+
+1. `clients.policy` внешнего клиента (`ask` | `auto`), если он не `inherit`;
+2. `bots.a2a_policy` получателя;
+3. `TG_GATEWAY_A2A_POLICY` (по умолчанию `ask`).
+
+Для бот-задач вместо клиента берётся политика маршрута `(src → dst)`; новое исходящее
+всегда спрашивает владельца, продолжение по тому же `ctx` — по политике маршрута.
+
+`params.wait_seconds` (или `TG_GATEWAY_A2A_WAIT`, дефолт 0) — сколько хаб держит
+соединение, дожидаясь клика/ответа агента, чтобы клиент без поллинга получил результат
+в том же вызове. Максимум 100 с.
+
+### 3.6 Результат задачи в `task`
+
+- `artifacts[0].parts[0].text` — **ответ агента** (`artifactId = <task>-out`);
+- `history` — сообщения задачи: `user` (вход) и `agent` (ответ); `historyLength`
+  ограничивает их число (0 — без истории, не задано — все);
+- входной текст без ответа виден в `history[0]` (роль `user`) и в `message/send` либо `working` (политика `auto` для продолжения).
 
 ### 3.2 `message/send` — хаб → агент (доставка задачи)
 
@@ -192,13 +219,22 @@ auth-required ──клик владельца──▶ working ──▶ compl
 - `tgw_<client_id>_<secret>` — внешний клиент: список ботов, политика (`inherit|ask|auto`),
   лимиты (`max_text`, `per_min`, `per_hour`), срок действия, отзыв.
 
+Клиент создаётся в меню хаба («🔑 Клиенты»): токен показывается один раз, в БД только
+sha256 и префикс. Настраивается: разрешённые боты, политика, `max_text`, `per_min`,
+`per_hour`, срок действия (`expires_at`), ротация и отзыв (действуют сразу).
+
 Проверки по клиенту: `-32003` (бот не разрешён), `-32005` (лимит частоты), задачи
 фильтруются по `tasks.client_id`. Ошибка авторизации — HTTP 401 на любом эндпоинте.
-Сессии задач одного клиента не видны другому.
+Сессии задач одного клиента не видны другому. Истёкший или отозванный токен → 401,
+событие `client_denied` с причиной (`bot`/`revoked`/`expired`).
 
 ## 11. Аудит
 
 Хаб: таблица `events` (`relay_parked`, `card_approved`, `delivered`, `reply_parked`,
+`a2a_parked`, `a2a_auto_delivered`, `a2a_answered`, `a2a_input_required`, `a2a_skipped`,
+`client_created`, `client_auth`, `client_denied`, `client_rate_limited`,
+`client_token_rotated`, `client_revoked`, `client_expiry_changed`, `client_bots_changed`,
+`route_context_changed`, `menu_*`,
 `task_skipped`, `ttl_rejected`, `rpc_dedup`, `rpc_dedup_fingerprint`, `hop_limit`,
 `peer_blocked`, `peer_circuit_open`, `card_unauthorized`, `hub_error`).
 Агент: `logs/gateway-relay-audit.jsonl` (`hub_inbound`, `rpc_tasks_update`,
