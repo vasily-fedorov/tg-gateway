@@ -386,10 +386,16 @@ class Hub:
                 if not peer:
                     return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_FOUND,
                                                         f"нет бота «{target}»"))
-                return self.say(bot_id, rpc.rpc_ok(rpc_id, {"card": rpc.bot_card(peer, owner)}))
+                me = self.db.bot_by_id(bot_id)
+                return self.say(bot_id, rpc.rpc_ok(rpc_id, {
+                    "card": rpc.bot_card(peer, owner),
+                    "routes": self.routes_for_bot(owner, str(me["alias"])) if me else []}))
+            me = self.db.bot_by_id(bot_id)
+            routes = self.routes_for_bot(owner, str(me["alias"])) if me else []
             return self.say(bot_id, rpc.rpc_ok(rpc_id, {
                 "card": rpc.hub_card(owner, self.db.bots(owner)),
-                "cards": [rpc.bot_card(b, owner) for b in self.db.bots(owner)]}))
+                "cards": [rpc.bot_card(b, owner) for b in self.db.bots(owner)],
+                "routes": routes}))
 
         if method in ("message/send", "message/stream"):
             msg = params.get("message") or {}
@@ -735,7 +741,8 @@ class Hub:
                 found = self.db.bot_by_alias(owner, alias)
                 if not found:
                     return {"message": f"бот «{alias}» не найден"}, rpc.ERR_TASK_NOT_FOUND
-                return {"card": rpc.bot_card(found, owner)}, 0
+                return {"card": rpc.bot_card(found, owner),
+                        "routes": self.routes_for_bot(owner, alias)}, 0
             return {"card": rpc.hub_card(owner, self.db.bots(owner),
                                          public_url=self._a2a_public_url())}, 0
 
@@ -795,6 +802,26 @@ class Hub:
             return {"task": rpc.task_view(self.db.task(str(task["task_id"])))}, 0
 
         return {"message": f"неизвестный метод: {method}"}, rpc.ERR_METHOD_NOT_FOUND
+
+    def routes_for_bot(self, owner: int, alias: str) -> list:
+        """Куда этому боту можно отправлять: все включённые боты + политика маршрута."""
+        rows = self.db.q(
+            "SELECT b.alias, b.username, b.description, "
+            "       r.policy, r.max_text, r.per_hour, r.context_mode, (r.id IS NOT NULL) AS explicit "
+            "FROM bots b LEFT JOIN routes r ON r.owner_tg=b.owner_tg AND r.dst_alias=b.alias "
+            "  AND r.src_alias=? "
+            "WHERE b.owner_tg=? AND b.enabled=1 AND b.alias<>? ORDER BY b.alias",
+            (alias, owner, alias))
+        out = []
+        for r in rows:
+            out.append({"alias": r["alias"], "username": r["username"],
+                        "description": r["description"] or "",
+                        "policy": r["policy"] or "ask",
+                        "max_text": int(r["max_text"] or policy.MAX_TEXT),
+                        "per_hour": int(r["per_hour"] or policy.PER_HOUR),
+                        "context": ("off" if str(r["context_mode"] or "") == "off" else "on"),
+                        "explicit_route": bool(r["explicit"])})
+        return out
 
     def _a2a_public_url(self) -> str:
         url = (os.environ.get("TG_GATEWAY_A2A_PUBLIC_URL") or "").strip()

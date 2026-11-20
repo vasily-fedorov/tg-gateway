@@ -1406,6 +1406,25 @@ def run() -> dict:
     assert payloads[-1]["params"]["message"]["parts"][0]["text"] == "21 ГБ"
     res["a2a_answer_marked"] = True
 
+    # 10z2. agent/card отдаёт боту его актуальные маршруты (источник истины — хаб)
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    pair(hub, tg, bot_id=GOD, alias="god")
+    hub.db.set_route(OWNER, "aa", "god", policy="auto", max_text=2000, per_hour=7)
+    tg.sent.clear()
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "c-1", "method": "agent/card",
+                                   "params": {"alias": "aa"}}), is_bot=True, username="aa"))
+    reply = json.loads([x for x in tg.sent if x["chat"] == AA][-1]["text"])
+    routes = reply["result"]["routes"]
+    assert len(routes) == 1 and routes[0]["alias"] == "god", routes
+    assert routes[0]["policy"] == "auto" and routes[0]["max_text"] == 2000, routes[0]
+    assert routes[0]["per_hour"] == 7 and routes[0]["explicit_route"] is True, routes[0]
+    assert "aa" not in [r["alias"] for r in routes], "себя в адресатах быть не должно"
+    # HTTP-путь отдаёт то же
+    card, _ = hub.http_rpc("agent/card", {"alias": "aa"})
+    assert card["routes"][0]["alias"] == "god", card
+    res["agent_card_routes"] = True
+
     # старый самодельный конверт больше не принимается
     hub, tg = new_hub()
     pair(hub, tg, bot_id=GOD, alias="god")
