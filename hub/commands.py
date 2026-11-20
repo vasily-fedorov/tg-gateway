@@ -20,10 +20,6 @@ COMMANDS: List[Tuple[str, str]] = [
     ("task", "детали задачи"),
     ("protocol", "протокол для агента"),
     ("card", "A2A-карточка хаба или бота"),
-    ("share", "приглашение для связи с чужим владельцем"),
-    ("link", "связать своего бота с чужим"),
-    ("links", "межвладельческие связи"),
-    ("unlink", "разорвать связь"),
     ("cancel", "отменить задачу"),
     ("unpair", "отключить бота"),
     ("help", "справка"),
@@ -33,7 +29,6 @@ COMMANDS: List[Tuple[str, str]] = [
 MENU_ROWS: List[List[Tuple[str, str]]] = [
     [("🤖 Боты", "hub:menu:bots"), ("🔀 Маршруты", "hub:menu:routes")],
     [("📜 Задачи", "hub:menu:log"), ("📘 Протокол", "hub:menu:protocol")],
-    [("🔗 Связи", "hub:menu:links"), ("🔑 Клиенты", "hub:menu:clients")],
     [("❓ Помощь", "hub:menu:help")],
 ]
 

@@ -13,33 +13,26 @@ from typing import Any, Dict, Optional
 
 PROTOCOL_VERSION = "1.0"
 
-# Внутренние состояния → состояния A2A. `skipped` в A2A нет: отдаём как completed
-# с metadata.skipped=true, чтобы не выдумывать несуществующее состояние.
-STATE_MAP = {
-    "submitted": "auth-required",   # ждём подтверждения владельца
-    "working": "working",
-    "input-required": "input-required",
-    "completed": "completed",
-    "failed": "failed",
-    "rejected": "rejected",
-    "cancelled": "canceled",
-    "skipped": "completed",
-}
-
-
-def a2a_state(status: str) -> str:
-    return STATE_MAP.get(str(status), "unknown")
+# Состояния — в spec-виде (TASK_STATE_*): так их понимает и Hermes-клиент, и любой
+# A2A-клиент. `skipped` в A2A нет: отдаём как completed с metadata.skipped=true.
+from .db import a2a_state  # noqa: E402  (переиспользуем таблицу соответствий)
 
 
 def task_view(task: Any, *, history_length: Optional[int] = None,
-              a2a: bool = False) -> Dict[str, Any]:
-    """A2A Task из строки БД."""
+              a2a: bool = False, messages: Optional[list] = None) -> Dict[str, Any]:
+    """A2A Task из строки БД: состояние, прогресс, артефакт (ответ), история."""
     t = dict(task)
     state = a2a_state(t["status"])
     status: Dict[str, Any] = {"state": state, "timestamp": _iso(t.get("updated_at"))}
-    if t.get("question"):
-        status["message"] = {"role": "agent", "messageId": f"{t['task_id']}-q",
-                             "parts": [{"kind": "text", "text": t["question"]}]}
+    # Что показать клиенту как статус: вопрос > прогресс > дефолт по состоянию
+    note = (t.get("question") or t.get("progress") or "").strip()
+    if not note and t["status"] == "submitted":
+        note = "Задача ждёт подтверждения владельца в Telegram."
+    if not note and t["status"] == "working":
+        note = "Выполняется."
+    if note:
+        status["message"] = {"role": "agent", "messageId": f"{t['task_id']}-s",
+                             "parts": [{"kind": "text", "text": note}]}
     view: Dict[str, Any] = {
         "id": t["task_id"],
         "contextId": t["ctx"],
@@ -50,6 +43,9 @@ def task_view(task: Any, *, history_length: Optional[int] = None,
             "from": t.get("src_alias"),
             "to": t.get("dst_alias"),
             "humanApproval": True,
+            "progress": (t.get("progress") or "").strip(),
+            "heartbeat": _iso(t.get("heartbeat_at")) if t.get("heartbeat_at") else "",
+            "updatedAt": _iso(t.get("updated_at")),
         },
     }
     if t["status"] == "skipped":
@@ -58,13 +54,20 @@ def task_view(task: Any, *, history_length: Optional[int] = None,
     if t.get("answer"):
         view["artifacts"] = [{"artifactId": f"{t['task_id']}-out",
                               "parts": [{"kind": "text", "text": t["answer"]}]}]
-    messages = []
-    if t.get("text"):
-        messages.append({"role": "user", "messageId": f"{t['task_id']}-in",
-                         "parts": [{"kind": "text", "text": t["text"]}]})
-    if t.get("answer"):
-        messages.append({"role": "agent", "messageId": f"{t['task_id']}-a",
-                         "parts": [{"kind": "text", "text": t["answer"]}]})
+    built = []
+    for row in (messages or []):
+        r = dict(row)
+        role = "agent" if str(r.get("role")) == "agent" else "user"
+        built.append({"role": role, "messageId": f"{t['task_id']}-m{r.get('id', '')}",
+                      "parts": [{"kind": "text", "text": str(r.get("text") or "")}]})
+    if not built:
+        if t.get("text"):
+            built.append({"role": "user", "messageId": f"{t['task_id']}-in",
+                          "parts": [{"kind": "text", "text": t["text"]}]})
+        if t.get("answer"):
+            built.append({"role": "agent", "messageId": f"{t['task_id']}-a",
+                          "parts": [{"kind": "text", "text": t["answer"]}]})
+    messages = built
     if history_length is None:          # A2A: не задано = без ограничения
         limit = len(messages) or 1
     else:

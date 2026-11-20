@@ -18,7 +18,6 @@ import sys
 import time
 from typing import Any, Dict, Iterable, Optional
 
-from . import clients as clientlib
 from . import commands, policy, protocol, rpc
 from .db import CARD_TTL_S, TERMINAL, Db
 from .tg import Tg
@@ -36,10 +35,6 @@ HELP = (
     "/log [алиас] [N] — последние задачи (пришедшие и отправленные)\n"
     "/task <id> — детали задачи и её события\n"
     "/protocol — протокол в формате для агента (что от него ждут)\n"
-    "/share <алиас> — код приглашения для связи с чужим владельцем\n"
-    "/link <код> <мой_алиас> — связать своего бота с ботом другого владельца\n"
-    "/links — межвладельческие связи (id, политики)\n"
-    "/unlink <id> — разорвать связь\n"
     "/help — это сообщение\n\n"
     "Всё, что бот присылает вам на подтверждение, приходит карточкой сюда.\n"
     "Ответ на вопрос бота — просто текстом в ответ на карточку."
@@ -180,18 +175,6 @@ class Hub:
                              f"{r['status']}  h{r['hops']}  {when}  «{text_short}»")
             self.db.event("owner_log", owner=uid, alias=alias or "*", count=len(rows))
             return self.say(uid, "```\n" + "\n".join(lines) + "\n```")
-        if low.startswith("/clients"):
-            return self.send_menu_section(uid, uid, None, "clients")
-        if low.startswith("/client"):
-            parts = text.split()
-            if len(parts) < 2:
-                return self.say(uid, "Использование: /client <cl_xxxxxx>")
-            return self.send_client_card(uid, uid, None, parts[1].strip())
-        if low.startswith("/token"):
-            parts = text.split()
-            if len(parts) < 2:
-                return self.say(uid, "Использование: /token <cl_xxxxxx>")
-            return self.do_client_rotate(uid, uid, None, parts[1].strip())
         if low.startswith("/task"):
             parts = text.split()
             if len(parts) < 2:
@@ -234,60 +217,6 @@ class Hub:
             card = rpc.hub_card(uid, self.db.bots(uid))
             return self.say(uid, object.__str__(card["description"]) + "\n\n" +
                             envelope(**card))
-        if low.startswith("/share"):
-            parts = text.split()
-            if len(parts) < 2:
-                return self.say(uid, "Использование: /share <алиас>")
-            bot = self.db.bot_by_alias(uid, parts[1].strip())
-            if not bot:
-                return self.say(uid, "Такого бота нет.")
-            code = "LINK-" + secrets.token_hex(2).upper()
-            self.db.create_invite(int(bot["bot_id"]), uid, code)
-            self.db.event("invite_created", owner=uid, alias=parts[1])
-            return self.say(uid, f"Код для связи с ботом «{parts[1]}»:\n\n{code}\n\n"
-                                 "Передайте его второму владельцу: он введёт "
-                                 f"/link {code} <свой_алиас>\n"
-                                 "Код одноразовый. Входящие от чужого владельца "
-                                 "по умолчанию требуют вашего подтверждения.")
-        if low.startswith("/link"):
-            parts = text.split()
-            if len(parts) < 3:
-                return self.say(uid, "Использование: /link <код> <мой_алиас>")
-            mine = self.db.bot_by_alias(uid, parts[2].strip())
-            if not mine:
-                return self.say(uid, "Сначала /pair <алиас> — такого бота у вас нет.")
-            row = self.db.redeem_invite(parts[1])
-            if not row:
-                return self.say(uid, "Код не найден или уже использован.")
-            if int(row["owner_tg"]) == uid:
-                return self.say(uid, "Это ваш собственный код.")
-            self.db.add_link(int(mine["bot_id"]), int(row["bot_id"]))
-            self.db.event("link_created", owner=uid, src=int(mine["bot_id"]),
-                          dst=int(row["bot_id"]))
-            other = self.db.bot_by_id(int(row["bot_id"]))
-            self.say(uid, f"Связь создана: «{mine['alias']}» ↔ @{other['username']}.\n"
-                          "Исходящие — по вашей политике, входящие от него — по его.")
-            self.say(int(row["owner_tg"]),
-                     f"🔗 @{mine['username']} связался с вашим ботом @{other['username']}. "
-                     "Его исходящие будут приходить вам на подтверждение.")
-            return
-        if low.startswith("/links"):
-            rows = self.db.links_for_owner(uid)
-            if not rows:
-                return self.say(uid, "Связей нет. /share <алиас> → код для второго владельца.")
-            lines = [f"• #{r['id']} @{r['src_username']} → @{r['dst_username']} "
-                     f"(out {r['policy_src']}, in {r['policy_dst']})" for r in rows]
-            return self.say(uid, "Связи:\n" + "\n".join(lines))
-        if low.startswith("/unlink"):
-            parts = text.split()
-            if len(parts) < 2 or not parts[1].strip().isdigit():
-                return self.say(uid, "Использование: /unlink <id из /links>")
-            link = self.db.link_by_id(int(parts[1]))
-            if not link:
-                return self.say(uid, "Связи с таким id нет.")
-            self.db.drop_link(int(parts[1]))
-            self.db.event("link_dropped", owner=uid, link=int(parts[1]))
-            return self.say(uid, "Связь разорвана.")
         if low.startswith("/unpair"):
             parts = text.split()
             if len(parts) < 2:
@@ -463,70 +392,99 @@ class Hub:
             return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task)}))
 
         if method in ("tasks/update", "tasks/status"):
+            # Внутренний канал исполнитель → хаб (не публичный A2A-метод).
             task_id = str(params.get("task") or params.get("id") or "")
             task = self.db.task(task_id)
             if not task or int(task["owner_tg"]) != owner:
                 return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_FOUND,
                                                     "задача не найдена"))
             status = params.get("status") or {}
-            state = str(status.get("state") or "")
+            # Принимаем и spec-вид (TASK_STATE_WORKING), и короткий (working).
+            state = str(status.get("state") or "").replace("TASK_STATE_", "").lower()
+            state = state.replace("_", "-")
             text = ""
-            artifact = params.get("artifact") or {}
-            for part in (artifact.get("parts") or []):
+            for part in (params.get("artifact") or {}).get("parts") or []:
                 if str(part.get("kind") or "text") == "text":
                     text += str(part.get("text") or "")
-            message = status.get("message") or {}
             if not text:
-                for part in (message.get("parts") or []):
+                for part in (status.get("message") or {}).get("parts") or []:
                     if str(part.get("kind") or "text") == "text":
                         text += str(part.get("text") or "")
             text = text.strip()
+            if state in ("working", "submitted", "auth-required"):
+                # Прогресс/хартбит: задача остаётся живой, карточку не трогаем
+                if str(task["status"]) != "submitted":
+                    self.db.heartbeat(task_id, text)
+                    if text:
+                        self.db.add_message(task_id, "agent", text)
+                    self.db.event("task_progress", task_id=task_id, owner=owner,
+                                  chars=len(text))
+                return self.say(bot_id, rpc.rpc_ok(rpc_id,
+                                                   {"task": rpc.task_view(self.db.task(task_id))}))
             if state == "input-required":
-                verdict, question = "ask", text
-            elif state == "failed":
-                self.db.update_task(task_id, status="failed")
-                self.db.event("task_failed", task_id=task_id, owner=owner, via="rpc")
-                return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task)}))
-            elif text:
-                verdict, question = "done", ""
-            else:
-                verdict, question = "skip", ""
+                question = text[:1500]
+                self.db.update_task(task_id, status="input-required", question=question)
+                self.db.add_message(task_id, "agent", question)
+                self.db.event("task_input_required", task_id=task_id, owner=owner, via="rpc")
+                self.tg.send(owner, f"Агент «{task['dst_alias']}» спрашивает:\n\n"
+                                    f"{question}\n\nОтветьте текстом.")
+                return self.say(bot_id, rpc.rpc_ok(rpc_id,
+                                                   {"task": rpc.task_view(self.db.task(task_id))}))
+            if state in ("failed", "canceled", "cancelled", "rejected"):
+                final = "cancelled" if state.startswith("cancel") else state
+                self.db.update_task(task_id, status=final, progress=text[:300])
+                if text:
+                    self.db.add_message(task_id, "agent", text)
+                self.db.event(f"task_{final}", task_id=task_id, owner=owner, via="rpc")
+                return self.say(bot_id, rpc.rpc_ok(rpc_id,
+                                                   {"task": rpc.task_view(self.db.task(task_id))}))
+            # completed либо legacy-вызов без state: текст = финальный ответ
+            verdict = "done" if (text or state == "completed") else "skip"
             self.on_reply(bot, {"t": "reply", "task": task_id, "verdict": verdict,
-                                "text": text, "question": question})
-            fresh = self.db.task(task_id)
-            return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(fresh)}))
+                                "text": text, "question": ""})
+            return self.say(bot_id, rpc.rpc_ok(rpc_id,
+                                               {"task": rpc.task_view(self.db.task(task_id))}))
 
         if method in ("tasks/list", "tasks/poll"):
-            since = float(params.get("since") or 0)
             alias = str(bot["alias"])
-            limit = int(params.get("limit") or 50)
-            rows = self.db.q(
-                "SELECT * FROM tasks WHERE owner_tg=? AND updated_at > ? "
-                "AND (src_alias=? OR dst_alias=?) ORDER BY updated_at LIMIT ?",
-                (owner, since, alias, alias, limit))
-            cursor = max([float(r["updated_at"]) for r in rows], default=since)
+            rows = self.db.list_tasks(
+                owner,
+                status=str(params.get("status") or "").replace("TASK_STATE_", "").lower(),
+                ctx=str(params.get("contextId") or params.get("ctx") or ""),
+                since=float(params.get("since") or 0),
+                cursor=float(params.get("cursor") or 0),
+                limit=int(params.get("limit") or params.get("pageSize") or 50))
+            # Клиент опрашивает свои задачи: видимые ему — где он источник или адресат
+            rows = [r for r in rows if alias in (r["src_alias"], r["dst_alias"])] or rows
+            nxt = min([float(r["updated_at"]) for r in rows], default=0.0)
             return self.say(bot_id, rpc.rpc_ok(rpc_id, {
-                "tasks": [rpc.task_view(r) for r in rows], "cursor": cursor}))
+                "tasks": [rpc.task_view(r, messages=self.db.messages(r["task_id"], 5))
+                          for r in rows],
+                "nextCursor": nxt, "cursor": nxt}))
 
         if method == "tasks/get":
-            task = self.db.task(str(params.get("id") or ""))
+            task = self.db.task(str(params.get("id") or params.get("taskId") or ""))
             if not task or int(task["owner_tg"]) != owner:
                 return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_FOUND,
                                                     "задача не найдена"))
-            return self.say(bot_id, rpc.rpc_ok(rpc_id, {"task": rpc.task_view(task)}))
+            hist = params.get("historyLength")
+            limit = 20 if hist is None else int(hist)
+            return self.say(bot_id, rpc.rpc_ok(rpc_id, {
+                "task": rpc.task_view(task, history_length=limit,
+                                      messages=self.db.messages(task["task_id"], max(limit, 1) * 2))}))
 
         if method == "tasks/cancel":
-            task = self.db.task(str(params.get("id") or ""))
+            task = self.db.task(str(params.get("id") or params.get("taskId") or ""))
             if not task or int(task["owner_tg"]) != owner:
                 return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_FOUND,
                                                     "задача не найдена"))
-            if task["status"] in TERMINAL:
+            if str(task["status"]) in TERMINAL:
                 return self.say(bot_id, rpc.rpc_err(rpc_id, rpc.ERR_TASK_NOT_CANCELABLE,
                                                     f"задача уже {task['status']}"))
             self.db.update_task(task["task_id"], status="cancelled")
             self.db.event("task_cancelled", task_id=task["task_id"], owner=owner, via="rpc")
             if task["dst_alias"]:
-                self._notify_cancel(task["dst_alias"], owner, task["task_id"])
+                self._notify_cancel(str(task["dst_alias"]), owner, task["task_id"])
             return self.say(bot_id, rpc.rpc_ok(rpc_id,
                                                {"task": rpc.task_view(self.db.task(task["task_id"]))}))
 
@@ -562,14 +520,9 @@ class Hub:
         ctx = str(env.get("ctx") or "") or None
         hops = int(env.get("hops") or 1)
         target = self.db.bot_by_alias(owner, dst_alias)
-        link = None
-        if not target:
-            link = self.db.link_for(int(bot["bot_id"]), dst_alias)
-            if link:
-                target = self.db.bot_by_id(int(link["dst_id"]))
         if not target:
             return self.say(int(bot["bot_id"]), f"Нет бота «{dst_alias}» у владельца.")
-        if (str(bot["routes_mode"] or "explicit") == "explicit" and not link
+        if (str(bot["routes_mode"] or "explicit") == "explicit"
                 and not self.db.route(owner, str(bot["alias"]), dst_alias)):
             self.db.event("hidden_dst_refused", owner=owner, src=str(bot["alias"]), dst=dst_alias)
             return self.say(int(bot["bot_id"]), f"Нет маршрута к «{dst_alias}».")
@@ -579,7 +532,7 @@ class Hub:
         route = self.db.route(owner, bot["alias"], dst_alias)
         max_text = int(route["max_text"]) if route else policy.MAX_TEXT
         per_hour = int(route["per_hour"]) if route else policy.PER_HOUR
-        rpolicy = str(link["policy_src"]) if link else (str(route["policy"]) if route else "ask")
+        rpolicy = str(route["policy"]) if route else "ask"
         err = policy.check_limits(text, max_text=max_text, per_hour=per_hour,
                                   used_hour=self.db.hours_used(owner, bot["alias"], dst_alias))
         if err:
@@ -590,7 +543,7 @@ class Hub:
         ctx = ctx or new_id(4)
         approve = policy.needs_approval(policy=rpolicy, ctx=ctx if hops > 1 else "",
                                         hops=hops, direction="relay")
-        stored_dst = f"@{target['username']}" if link else dst_alias
+        stored_dst = str(target["alias"])
         self.db.create_task(task_id=task_id, owner=owner, direction="relay", ctx=ctx,
                             hops=hops, src=bot["alias"], dst=stored_dst, text=text,
                             status="submitted" if approve else "working",
@@ -606,27 +559,10 @@ class Hub:
             if ok and isinstance(res, dict):
                 self.db.update_task(task_id, card_chat=owner, card_msg=res.get("message_id"))
             return
-        self.after_src_approval(task_id, link)
+        self.after_src_approval(task_id)
 
-    def after_src_approval(self, task_id: str, link: Optional[Dict[str, Any]] = None) -> None:
-        """Исходящая сторона согласовала. Для чужого владельца — спросить и его."""
-        task = self.db.task(task_id)
-        if not task:
-            return
-        if link and str(link["policy_dst"]) == "ask":
-            # Ещё не доставлено: ждём карточку получателя, значит снова submitted
-            # (иначе задача висит в working и не попадает в TTL карточек).
-            self.db.update_task(task_id, status="submitted")
-            dst_owner = int(link["dst_owner"])
-            preview = str(task["text"] or "").replace("\n", " ")[:300]
-            ok, res = self.tg.send(
-                dst_owner,
-                f"Входящее от чужого владельца: {task['src_alias']} → @{link['dst_username']}"
-                f"\n\n{preview}\n\n· задача {task_id} · ctx {task['ctx']}",
-                [[("Принять", f"hub:in:{task_id}"), ("Отклонить", f"hub:inx:{task_id}")]])
-            if ok:
-                self.db.event("cross_inbound_parked", task_id=task_id, owner=dst_owner)
-            return
+    def after_src_approval(self, task_id: str) -> None:
+        """Исходящая сторона согласовала — доставляем получателю."""
         self.deliver(task_id)
 
     def card_text(self, src: str, dst: str, text: str, task_id: str, ctx: str, hops: int) -> str:
@@ -719,97 +655,6 @@ class Hub:
         return turns
 
     # ── ответ агента ─────────────────────────────────────────────────────────
-    def _is_a2a_task(self, task: Any) -> bool:
-        return str(task["src_alias"] or "") == "a2a-client"
-
-    LEGACY_CLIENT = {"client_id": "owner", "legacy": True, "name": "legacy (token владельца)",
-                     "bots_set": None, "policy": "inherit", "max_text": 4000,
-                     "per_min": 0, "per_hour": 0}
-
-    def http_rpc(self, method: str, params: Dict[str, Any],
-                 client: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], int]:
-        """JSON-RPC из HTTP-фронта (стандартный A2A-клиент). (result, код ошибки).
-
-        `client` — резолвнутый внешний клиент (hub/clients.py); без него — legacy
-        токен владельца со всеми правами и без лимитов.
-        """
-        client = dict(client or self.LEGACY_CLIENT)
-        owner = next(iter(self.owners)) if self.owners else None
-        if owner is None:
-            return {"message": "у хаба нет владельца"}, rpc.ERR_INTERNAL
-
-        method = {"SendMessage": "message/send", "GetTask": "tasks/get",
-                  "CancelTask": "tasks/cancel", "ListTasks": "tasks/list",
-                  "GetAgentCard": "agent/card", "StreamMessage": "message/stream"}.get(method, method)
-
-
-        if method in ("agent/card", "agent/getCard", "a2a/discover"):
-            alias = str(params.get("alias") or "").strip()
-            if alias:
-                found = self.db.bot_by_alias(owner, alias)
-                if not found:
-                    return {"message": f"бот «{alias}» не найден"}, rpc.ERR_TASK_NOT_FOUND
-                return {"card": rpc.bot_card(found, owner),
-                        "routes": self.routes_for_bot(owner, alias)}, 0
-            return {"card": rpc.hub_card(owner, self.db.bots(owner),
-                                         public_url=self._a2a_public_url())}, 0
-
-        if method in ("agent/protocol", "agent/help"):
-            return {"protocol": protocol.AGENT_PROTOCOL}, 0
-
-        if method in ("message/send", "message/stream"):
-            return self._http_message_send(owner, params, client)
-
-        if method == "tasks/get":
-            task = self.db.task(str(params.get("id") or ""))
-            if not task or int(task["owner_tg"]) != owner:
-                return {"message": "задача не найдена"}, rpc.ERR_TASK_NOT_FOUND
-            if not client.get("legacy") and str(task["client_id"] or "") != str(client["client_id"]):
-                return {"message": "задача не найдена"}, rpc.ERR_TASK_NOT_FOUND
-            raw_len = params.get("historyLength")
-            try:
-                history_length = None if raw_len is None else int(raw_len)
-            except (TypeError, ValueError):
-                history_length = None
-            return {"task": rpc.task_view(task, history_length=history_length,
-                                          a2a=True)}, 0
-
-        if method in ("tasks/list", "tasks/poll"):
-            since = float(params.get("since") or 0)
-            ctx = str(params.get("contextId") or "").strip()
-            status = str(params.get("status") or "").strip()
-            sql = "SELECT * FROM tasks WHERE owner_tg=? AND updated_at > ?"
-            args: list = [owner, since]
-            if ctx:
-                sql += " AND ctx=?"
-                args.append(ctx)
-            if status:
-                sql += " AND status=?"
-                args.append(status)
-            if not client.get("legacy"):
-                sql += " AND client_id=?"
-                args.append(str(client["client_id"]))
-            sql += " ORDER BY updated_at LIMIT ?"
-            args.append(int(params.get("limit") or 50))
-            rows = self.db.q(sql, tuple(args))
-            cursor = max([float(r["updated_at"]) for r in rows], default=since)
-            return {"tasks": [rpc.task_view(r) for r in rows], "cursor": cursor}, 0
-
-        if method == "tasks/cancel":
-            task = self.db.task(str(params.get("id") or ""))
-            if not task or int(task["owner_tg"]) != owner:
-                return {"message": "задача не найдена"}, rpc.ERR_TASK_NOT_FOUND
-            if not client.get("legacy") and str(task["client_id"] or "") != str(client["client_id"]):
-                return {"message": "задача не найдена"}, rpc.ERR_TASK_NOT_FOUND
-            if task["status"] in TERMINAL:
-                return {"message": f"задача уже {task['status']}"}, rpc.ERR_TASK_NOT_CANCELABLE
-            self.db.update_task(str(task["task_id"]), status="cancelled")
-            self.db.event("task_cancelled", task_id=task["task_id"], owner=owner, via="a2a")
-            if task["dst_alias"]:
-                self._notify_cancel(str(task["dst_alias"]), owner, str(task["task_id"]))
-            return {"task": rpc.task_view(self.db.task(str(task["task_id"])))}, 0
-
-        return {"message": f"неизвестный метод: {method}"}, rpc.ERR_METHOD_NOT_FOUND
 
     def _bot_mode(self, owner: int, alias: str) -> str:
         bot = self.db.bot_by_alias(owner, alias)
@@ -860,162 +705,49 @@ class Hub:
                         "description": (r["description"] or "")[:160], "self": False})
         return out
 
-    def _a2a_public_url(self) -> str:
-        url = (os.environ.get("TG_GATEWAY_A2A_PUBLIC_URL") or "").strip()
-        if url:
-            return url.rstrip("/")
-        port = (os.environ.get("TG_GATEWAY_A2A_PORT") or "").strip()
-        host = (os.environ.get("TG_GATEWAY_A2A_HOST") or "127.0.0.1").strip()
-        return f"http://{host}:{port}" if port else ""
-
-    def _http_message_send(self, owner: int, params: Dict[str, Any],
-                           client: Dict[str, Any] | None = None) -> Tuple[Dict[str, Any], int]:
-        client = dict(client or self.LEGACY_CLIENT)
-        cid = str(client["client_id"])
-        msg = params.get("message") or {}
-        to_alias = str(params.get("to") or msg.get("to") or "").strip()
-        if not to_alias:
-            bots = self.db.bots(owner)
-            if len(bots) == 1:
-                to_alias = str(bots[0]["alias"])
-            else:
-                names = ", ".join(str(b["alias"]) for b in bots)
-                return {"message": "нужен params.to (алиас бота) или путь /bot/<alias>; "
-                                   f"доступны: {names}"}, rpc.ERR_INVALID_PARAMS
-        target = self.db.bot_by_alias(owner, to_alias)
-        if not target:
-            return {"message": f"бот «{to_alias}» не найден"}, rpc.ERR_TASK_NOT_FOUND
-        allowed = client.get("bots_set")
-        if allowed is not None and to_alias not in allowed:
-            self.db.event("client_denied", owner=owner, client=cid, reason="bot", dst=to_alias)
-            return {"message": f"клиенту «{client['name'] or cid}» запрещён бот «{to_alias}»"}, \
-                rpc.ERR_FORBIDDEN_BOT
-        chunks, attachments = [], []
-        for part in (msg.get("parts") or []):
-            kind = str(part.get("kind") or "text")
-            if kind == "text":
-                chunks.append(str(part.get("text") or ""))
-            elif kind in ("data", "file"):
-                attachments.append(part)
-        text = "\n".join(x.strip() for x in chunks if x.strip()).strip()
-        max_text = int(client.get("max_text") or policy.MAX_TEXT)
-        per_min = int(client.get("per_min") or 0)
-        per_hour = int(client.get("per_hour") or 0)
-        if per_min and self.db.client_task_count(cid, 60) >= per_min:
-            self.db.event("client_rate_limited", owner=owner, client=cid, window="1m")
-            return {"message": f"лимит клиента {per_min}/мин исчерпан"}, rpc.ERR_RATE_LIMITED
-        if per_hour and self.db.client_task_count(cid, 3600) >= per_hour:
-            self.db.event("client_rate_limited", owner=owner, client=cid, window="1h")
-            return {"message": f"лимит клиента {per_hour}/час исчерпан"}, rpc.ERR_RATE_LIMITED
-        err = policy.check_limits(text, max_text=max_text)
-        if err:
-            return {"message": err}, rpc.ERR_INVALID_PARAMS
-        task_id = new_id()
-        ctx = str(msg.get("contextId") or "") or new_id(4)
-        self.db.create_task(task_id=task_id, owner=owner, direction="a2a", ctx=ctx, hops=1,
-                            src="a2a-client", dst=to_alias, text=text, status="submitted",
-                            attachments=json.dumps(attachments, ensure_ascii=False),
-                            client_id=None if client.get("legacy") else cid)
-        # Политика хаба: спрашивать владельца или доставлять сразу.
-        client_policy = str(client.get("policy") or "inherit").strip().lower()
-        mode = (client_policy if client_policy in ("ask", "auto")
-                else (str(target["a2a_policy"] or "").strip()
-                      or (os.environ.get("TG_GATEWAY_A2A_POLICY") or "ask").strip()).lower())
-        mode = mode if mode in ("ask", "auto") else "ask"
-        if mode == "auto":
-            ok = self.deliver(task_id)
-            self.db.event("a2a_auto_delivered", task_id=task_id, owner=owner, client=cid,
-                          dst=to_alias, ok=bool(ok), length=len(text))
-        else:
-            preview = text.replace("\n", " ")[:300] or "(без текста)"
-            ok, res = self.tg.send(owner, f"🌐 Внешний A2A-клиент → «{to_alias}»?\n\n{preview}\n\n"
-                                          f"· задача {task_id} · ctx {ctx}",
-                                   [[("Отправить", f"hub:ok:{task_id}"),
-                                     ("Отклонить", f"hub:no:{task_id}")]])
-            if ok and isinstance(res, dict):
-                self.db.update_task(task_id, card_chat=owner, card_msg=res.get("message_id"))
-            self.db.event("a2a_parked", task_id=task_id, owner=owner, client=cid,
-                          dst=to_alias, length=len(text))
-        wait_s = float(params.get("wait_seconds")
-                       or (params.get("metadata") or {}).get("wait_seconds")
-                       or os.environ.get("TG_GATEWAY_A2A_WAIT") or 0)
-        wait_s = max(0.0, min(wait_s, 100.0))
-        if wait_s:
-            deadline = time.time() + wait_s
-            while time.time() < deadline:
-                task = self.db.task(task_id)
-                if task and task["status"] in TERMINAL:
-                    break
-                if task and task["answer"]:
-                    break
-                time.sleep(0.5)
-        task = self.db.task(task_id)
-        view = rpc.task_view(task)
-        if view["status"]["state"] == "working":
-            view["status"]["message"] = {
-                "role": "agent", "messageId": f"{task_id}-working",
-                "parts": [{"kind": "text",
-                           "text": f"Задача {task_id} в работе у «{to_alias}» — "
-                                   f"результат в tasks/get (contextId {task['ctx']})."}]}
-        if view["status"]["state"] == "auth-required":
-            view["status"]["message"] = {
-                "role": "agent", "messageId": f"{task_id}-pending",
-                "parts": [{"kind": "text",
-                           "text": "Задача ждёт подтверждения владельца в Telegram. "
-                                   f"Готово будет видно через tasks/get (id {task_id}), "
-                                   f"contextId {task['ctx']}."}]}
-        return {"task": view}, 0
-
     def on_reply(self, bot: Any, env: Dict[str, Any]) -> None:
+        """Исполнитель закрыл задачу: фиксируем ответ и отправляем его инициатору."""
         owner = int(bot["owner_tg"])
         task = self.db.task(str(env.get("task") or ""))
         if not task or int(task["owner_tg"]) != owner:
             return self.say(int(bot["bot_id"]), "Задача не найдена.")
         verdict = str(env.get("verdict") or "done").lower()
         text = str(env.get("text") or "").strip()
+        task_id = str(task["task_id"])
 
-        if self._is_a2a_task(task):
-            if verdict == "skip":
-                self.db.update_task(task["task_id"], status="skipped")
-                self.db.event("a2a_skipped", task_id=task["task_id"], owner=owner)
-            elif verdict == "ask":
-                question = str(env.get("question") or text or "").strip()[:1500]
-                self.db.update_task(task["task_id"], status="input-required", question=question)
-                self.db.event("a2a_input_required", task_id=task["task_id"], owner=owner)
-                self.tg.send(owner, f"🌐 Клиент ждёт ответа от «{task['dst_alias']}»:\n\n"
-                                    f"{question}\n\nОтветьте текстом.")
-            else:
-                self.db.update_task(task["task_id"], status="completed", answer=text)
-                self.db.event("a2a_answered", task_id=task["task_id"], owner=owner,
-                              length=len(text))
-            return
         if verdict == "skip":
-            self.db.update_task(task["task_id"], status="skipped")
-            self.db.event("task_skipped", task_id=task["task_id"], owner=owner)
+            self.db.update_task(task_id, status="skipped")
+            self.db.event("task_skipped", task_id=task_id, owner=owner)
             return
         if verdict == "ask":
             question = str(env.get("question") or text or "").strip()[:1500]
-            self.db.update_task(task["task_id"], status="input-required", question=question)
-            self.db.event("task_input_required", task_id=task["task_id"], owner=owner)
+            self.db.update_task(task_id, status="input-required", question=question)
+            self.db.add_message(task_id, "agent", question)
+            self.db.event("task_input_required", task_id=task_id, owner=owner)
             self.tg.send(owner, f"Агент «{task['dst_alias']}» спрашивает:\n\n{question}\n\n"
-                                f"Ответьте текстом на это сообщение.\n· задача {task['task_id']}")
+                                "Ответьте текстом на это сообщение.")
             return
-        # done: ответ возвращается инициатору как новая задача в том же ctx
-        src = str(task["src_alias"])
-        dst = str(task["dst_alias"])
-        hops = int(task["hops"])
+
+        # done: ответ фиксируется на самой задаче (artifacts) и уходит инициатору
+        self.db.update_task(task_id, status="completed", answer=text, question="")
+        self.db.add_message(task_id, "agent", text)
+        self.db.event("task_completed", task_id=task_id, owner=owner, length=len(text))
+
+        src = str(task["src_alias"] or "")
+        dst = str(task["dst_alias"] or "")
+        hops = int(task["hops"] or 1)
+        if not src or src == dst:
+            return
         back_id = new_id()
         route = self.db.route(owner, dst, src)
         rpolicy = str(route["policy"]) if route else "ask"
         approve = policy.needs_approval(policy=rpolicy, ctx=task["ctx"], hops=hops + 1,
                                         direction="reply")
-        # hops у задачи = номер хопа, с которым сообщение уйдёт получателю (deliver добавит +1)
         self.db.create_task(task_id=back_id, owner=owner, direction="reply", ctx=task["ctx"],
                             hops=hops, src=dst, dst=src, text=text,
                             status="submitted" if approve else "working")
         self.db.event("reply_parked" if approve else "reply_auto", task_id=back_id, owner=owner,
                       src=dst, dst=src, hops=hops + 1)
-        self.db.update_task(task["task_id"], status="completed")
         if approve:
             ok, res = self.tg.send(owner, self.card_text(dst, src, text, back_id, task["ctx"],
                                                          hops + 1),
@@ -1045,8 +777,7 @@ class Hub:
             return self.send_menu_section(uid, chat_id, msg_id, task_id)
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
                        "desc", "new", "newr", "rdel", "rdelok", "tfull", "a2apol", "rctx",
-                       "cl", "cname", "cbot", "cpol", "cmax", "cph", "crot", "croty",
-                       "crev", "crevy", "cexp", "lnk", "lpol", "rmode"):
+                       "rmode"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -1067,28 +798,6 @@ class Hub:
                 return self.do_route_delete(uid, chat_id, msg_id, task_id)
             if verdict == "tfull":
                 return self.send_task_full(uid, chat_id, task_id)
-            if verdict == "lnk":
-                return self.send_link_card(uid, chat_id, msg_id, task_id)
-            if verdict == "lpol":
-                return self.toggle_link_policy(uid, chat_id, msg_id, task_id)
-            if verdict == "cl":
-                return self.send_client_card(uid, chat_id, msg_id, task_id)
-            if verdict == "cname":
-                return self.begin_client_rename(uid, chat_id, msg_id, task_id)
-            if verdict == "cbot":
-                return self.toggle_client_bot(uid, chat_id, msg_id, task_id)
-            if verdict in ("cpol", "cmax", "cph"):
-                return self.cycle_client_setting(uid, chat_id, msg_id, task_id, verdict)
-            if verdict == "cexp":
-                return self.cycle_client_expiry(uid, chat_id, msg_id, task_id)
-            if verdict == "crot":
-                return self.confirm_client_rotate(uid, chat_id, msg_id, task_id)
-            if verdict == "croty":
-                return self.do_client_rotate(uid, chat_id, msg_id, task_id)
-            if verdict == "crev":
-                return self.confirm_client_revoke(uid, chat_id, msg_id, task_id)
-            if verdict == "crevy":
-                return self.do_client_revoke(uid, chat_id, msg_id, task_id)
             if verdict == "rctx":
                 return self.toggle_context(uid, chat_id, msg_id, task_id)
             if verdict == "rmode":
@@ -1104,29 +813,6 @@ class Hub:
             self.tg.answer_callback(cb_id, "Задача не найдена")
             return self.finish_card(chat_id, msg_id, "⌛ Задача неактивна.")
 
-        # Входящая карточка чужого владельца: права проверяем по владельцу получателя
-        if verdict in ("in", "inx"):
-            dst_bot = self.db.bot_by_username(str(task["dst_alias"]))
-            if not dst_bot or int(dst_bot["owner_tg"]) != uid:
-                self.db.event("card_unauthorized", task_id=task_id, owner=uid)
-                self.tg.answer_callback(cb_id, "Нет прав")
-                return self.finish_card(chat_id, msg_id, "⛔ Нет прав.")
-            if task["status"] in TERMINAL:
-                self.tg.answer_callback(cb_id, "Уже закрыта")
-                return self.finish_card(chat_id, msg_id, f"⌛ Задача уже {task['status']}.")
-            if verdict == "inx":
-                self.tg.answer_callback(cb_id, "Отклонено")
-                self.db.update_task(task_id, status="rejected")
-                self.db.event("cross_inbound_rejected", task_id=task_id, owner=uid)
-                self.say(int(task["owner_tg"]),
-                         f"Получатель отклонил входящее по задаче {task_id}.")
-                return self.finish_card(chat_id, msg_id, "❌ Отклонено.")
-            self.tg.answer_callback(cb_id, "Принято")
-            ok = self.deliver(task_id)
-            self.db.event("cross_inbound_approved", task_id=task_id, owner=uid, ok=bool(ok))
-            return self.finish_card(chat_id, msg_id,
-                                    "✅ Доставлено" if ok else "❌ Не доставлено")
-
         if int(task["owner_tg"]) != uid:  # чужую карточку подтверждать нельзя
             self.db.event("card_unauthorized", task_id=task_id, owner=uid)
             self.tg.answer_callback(cb_id, "Нет прав")
@@ -1141,16 +827,6 @@ class Hub:
             return self.finish_card(chat_id, msg_id, "❌ Отклонено.")
         self.db.update_task(task_id, status="working")
         self.db.event("card_approved", task_id=task_id, owner=uid)
-        src_bot = self.db.bot_by_alias(int(task["owner_tg"]), str(task["src_alias"]))
-        link = None
-        if src_bot and str(task["dst_alias"] or "").startswith("@"):
-            link = self.db.link_for(int(src_bot["bot_id"]), str(task["dst_alias"]))
-        if link:
-            self.after_src_approval(task_id, link)
-            sent = self.db.task(task_id)["status"] != "rejected"
-            return self.finish_card(chat_id, msg_id,
-                                    "✅ Отправлено, ждём подтверждения получателя"
-                                    if sent else "❌ Отклонено")
         ok = self.deliver(task_id)
         self.finish_card(chat_id, msg_id,
                          f"✅ Отправлено → {task['dst_alias']}" if ok else "❌ Не доставлено")
@@ -1173,449 +849,6 @@ class Hub:
                        "«/pair <код> <алиас>». /cancel — отменить.",
                        [[("⬅️ Боты", "hub:menu:bots"), ("❌ Закрыть", "hub:menu:close")]])
             return
-        if kind == "client":
-            self.db.set_state(uid, "client_new")
-            self._show(uid, chat, msg_id,
-                       "Имя нового внешнего клиента (например langchain-prod).\n"
-                       "Дальше выдам токен — он показывается один раз. /cancel — отменить.",
-                       [[("⬅️ Клиенты", "hub:menu:clients"), ("❌ Закрыть", "hub:menu:close")]])
-            return
-        self.db.set_state(uid, "new_route", "{}")
-        return self.route_wizard(uid, chat, msg_id, "src", "")
-
-    def route_wizard(self, uid: int, chat: Any, msg_id: Any, step: str, value: str) -> None:
-        """Пошаговое создание маршрута: отправитель → получатель → политика."""
-        st = self.db.get_state(uid)
-        draft = {}
-        if st and str(st["action"]) == "new_route":
-            try:
-                draft = json.loads(st["payload"] or "{}")
-            except ValueError:
-                draft = {}
-
-        if step == "reset":
-            self.db.clear_state(uid)
-            draft = {"src": ""}
-            self.db.set_state(uid, "new_route", json.dumps(draft, ensure_ascii=False))
-            return self.route_wizard(uid, chat, msg_id, "src", "")
-
-        if step == "src" and not value:
-            draft = {"src": ""}
-            self.db.set_state(uid, "new_route", json.dumps(draft, ensure_ascii=False))
-            rows = [[("— это я —", "hub:newr:src:-")]]
-            rows += [[(f"🪪 {b['alias']}", f"hub:newr:src:{b['alias']}")]
-                     for b in self.db.bots(uid)]
-            rows.append([("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")])
-            return self._show(uid, chat, msg_id, "Новый маршрут. Шаг 1/3: кто отправляет?", rows)
-
-        if step == "src":
-            draft["src"] = "" if value in ("-", "") else value
-            self.db.set_state(uid, "new_route", json.dumps(draft, ensure_ascii=False))
-            rows = [[(f"🪪 {b['alias']}", f"hub:newr:dst:{b['alias']}")]
-                    for b in self.db.bots(uid) if b["alias"] != draft.get("src")]
-            rows.append([("⬅️ Назад", "hub:newr:reset"), ("❌ Закрыть", "hub:menu:close")])
-            return self._show(uid, chat, msg_id,
-                              f"Новый маршрут {draft.get('src') or 'вы'} → ? Шаг 2/3: кому?", rows)
-
-        if step == "dst":
-            draft["dst"] = value
-            self.db.set_state(uid, "new_route", json.dumps(draft, ensure_ascii=False))
-            rows = [[("ask — спрашивать владельца", "hub:newr:pol:ask"),
-                     ("auto — без карточки", "hub:newr:pol:auto")],
-                    [("⬅️ Назад", "hub:newr:reset"), ("❌ Закрыть", "hub:menu:close")]]
-            return self._show(uid, chat, msg_id,
-                              f"Новый маршрут {draft.get('src') or 'вы'} → {value}. "
-                              "Шаг 3/3: когда спрашивать?", rows)
-
-        if step == "pol":
-            src = str(draft.get("src") or "")
-            dst = str(draft.get("dst") or "")
-            policy = value if value in ("ask", "auto") else "ask"
-            if not dst:
-                return self.route_wizard(uid, chat, msg_id, "src", "")
-            self.db.set_route(uid, src, dst, policy=policy)
-            self.db.clear_state(uid)
-            self.db.event("route_created", owner=uid, src=src, dst=dst, policy=policy, via="menu")
-            route = self.db.route(uid, src, dst)
-            return self.send_route(uid, chat, msg_id, str(route["id"]))
-
-        return self.route_wizard(uid, chat, msg_id, "src", "")
-
-    def handle_state_input(self, uid: int, action: str, payload: str, text: str) -> None:
-        """Текст, присланный в ответ на запрос из меню."""
-        value = text.strip()
-        if value.lower() in ("/cancel", "отмена", "cancel"):
-            self.db.clear_state(uid)
-            return self.say(uid, "Ввод отменён.")
-
-        if action == "describe":
-            alias = payload
-            ok = self.db.set_description(uid, alias, value)
-            self.db.clear_state(uid)
-            if not ok:
-                return self.say(uid, "Такого бота нет — ввод сброшен.")
-            self.db.event("bot_described", owner=uid, alias=alias, via="menu")
-            return self.send_bot_card(uid, uid, None, alias)
-
-        if action == "client_name":
-            ok = bool(self.db.client(uid, payload))
-            if not ok:
-                self.db.clear_state(uid)
-                return self.say(uid, "Клиент не найден — ввод сброшен.")
-            self.db.update_client(payload, name=value[:60])
-            self.db.clear_state(uid)
-            self.db.event("client_renamed", owner=uid, client=payload)
-            return self.send_client_card(uid, uid, None, payload)
-
-        if action == "client_new":
-            row, token = self.db.create_client(owner=uid, name=value[:60], bots="*")
-            self.db.clear_state(uid)
-            self.db.event("client_created", owner=uid, client=row["client_id"])
-            self.say(uid, f"🔑 Клиент {row['client_id']} создан.\n\nТокен "
-                          f"(показывается один раз, сохраните):\n\n{token}\n\n"
-                          "Подключайте как Bearer. Права и лимиты — в карточке клиента.")
-            return self.send_client_card(uid, uid, None, row["client_id"])
-
-        if action == "pair_alias":
-            alias = value[:20]
-            if self.db.bot_by_alias(uid, alias):
-                return self.say(uid, f"«{alias}» уже подключён. Пришлите другой алиас или /cancel.")
-            code = "HUB-" + secrets.token_hex(2).upper()
-            self.db.add_pair_code(uid, alias, code)
-            self.db.clear_state(uid)
-            self.db.event("pair_code_issued", owner=uid, alias=alias, via="menu")
-            return self.tg.send(uid, f"Код для «{alias}»:\n\n/pair {code} {alias}\n\n"
-                                     "Отправьте эту строку боту — он привяжется.",
-                                [[("⬅️ Боты", "hub:menu:bots"), ("❌ Закрыть", "hub:menu:close")]])
-
-        if action == "new_route":
-            parts = value.split()
-            if len(parts) < 2:
-                return self.say(uid, "Нужно: <от> <кому> [ask|auto]. Пример: god aa ask")
-            src = "" if parts[0] in ("-", "вы", "me") else parts[0]
-            dst = parts[1]
-            pol = parts[2].lower() if len(parts) > 2 else "ask"
-            if pol not in ("ask", "auto"):
-                return self.say(uid, "Политика: ask или auto")
-            if not self.db.bot_by_alias(uid, dst):
-                return self.say(uid, f"Нет бота «{dst}». Сначала /pair.")
-            self.db.set_route(uid, src, dst, policy=pol)
-            self.db.clear_state(uid)
-            self.db.event("route_created", owner=uid, src=src, dst=dst, policy=pol, via="menu")
-            return self.say(uid, f"✅ Маршрут {src or 'вы'} → {dst}: {pol}\n"
-                                 "Дальше его можно править в /menu → Маршруты.")
-
-        self.db.clear_state(uid)
-        return self.say(uid, "Ввод сброшен.")
-
-    def _show(self, uid: int, chat: Any, msg_id: Any, text: str, rows: list) -> bool:
-        """Показать экран: правим сообщение, если можем, иначе шлём новое."""
-        if msg_id:
-            ok, info = self.tg.edit(chat or uid, int(msg_id), text[:3900], rows)
-            if ok:
-                return True
-            self.db.event("menu_edit_failed", owner=uid, error=str(info)[:120])
-        ok, _ = self.tg.send(chat or uid, text[:3900], rows)
-        return bool(ok)
-
-    def send_bot_card(self, uid: int, chat: Any, msg_id: Any, alias: str) -> None:
-        bot = self.db.bot_by_alias(uid, alias)
-        back = [[("⬅️ Боты", "hub:menu:bots"), ("❌ Закрыть", "hub:menu:close")]]
-        if not bot:
-            return self._show(uid, chat, msg_id, f"Бота «{alias}» нет.", back)
-        card = rpc.bot_card(bot, uid)
-        caps = card["capabilities"]
-        text = (f"🪪 {card['name']}  ({alias})\n{card['description']}\n\n"
-                f"protocol: {card['protocolVersion']}\n"
-                f"capabilities: streaming={caps['streaming']}, "
-                f"push={caps['pushNotifications']}, humanApproval={caps['humanApproval']}\n"
-                f"skills: {', '.join(s['id'] for s in card['skills']) or '—'}\n"
-                f"bot_id: {bot['bot_id']}\n"
-                f"A2A: {self._a2a_mode(bot)} "
-                f"({'карточка владельцу' if self._a2a_mode(bot) == 'ask' else 'доставка сразу'})")
-        self.db.event("menu_bot_card", owner=uid, alias=alias)
-        self._show(uid, chat, msg_id, text,
-                   [[("✏️ Изменить описание", f"hub:desc:{alias}")],
-                    [(f"🌐 A2A → {'авто' if self._a2a_mode(bot) == 'ask' else 'спрашивать'}",
-                      f"hub:a2apol:{alias}")],
-                    [(f"👁 Маршруты → {'только явные' if str(bot['routes_mode'] or 'explicit') == 'explicit' else 'все боты'}",
-                      f"hub:rmode:{alias}")], *back])
-
-    def _a2a_mode(self, bot: Any) -> str:
-        mode = (str(bot["a2a_policy"] or "").strip()
-                or (os.environ.get("TG_GATEWAY_A2A_POLICY") or "ask").strip()).lower()
-        return mode if mode in ("ask", "auto") else "ask"
-
-    def toggle_routes_mode(self, uid: int, chat: Any, msg_id: Any, alias: str) -> None:
-        bot = self.db.bot_by_alias(uid, alias)
-        if not bot:
-            return self.send_bot_card(uid, chat, msg_id, alias)
-        new_mode = "all" if str(bot["routes_mode"] or "explicit") == "explicit" else "explicit"
-        self.db.set_routes_mode(uid, alias, new_mode)
-        self.db.event("bot_routes_mode_changed", owner=uid, alias=alias, mode=new_mode)
-        self.send_bot_card(uid, chat, msg_id, alias)
-
-    def toggle_a2a_policy(self, uid: int, chat: Any, msg_id: Any, alias: str) -> None:
-        bot = self.db.bot_by_alias(uid, alias)
-        if not bot:
-            return self.send_bot_card(uid, chat, msg_id, alias)
-        new_mode = "auto" if self._a2a_mode(bot) == "ask" else "ask"
-        self.db.set_a2a_policy(uid, alias, new_mode)
-        self.db.event("a2a_policy_changed", owner=uid, alias=alias, mode=new_mode)
-        self.send_bot_card(uid, chat, msg_id, alias)
-
-    def send_route(self, uid: int, chat: Any, msg_id: Any, route_id: str) -> None:
-        back = [[("⬅️ Маршруты", "hub:menu:routes"), ("❌ Закрыть", "hub:menu:close")]]
-        route = self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
-                            (int(route_id), uid)) if str(route_id).isdigit() else None
-        if not route:
-            return self._show(uid, chat, msg_id, "Маршрут не найден.", back)
-        policy = str(route["policy"])
-        ctx_mode = str(route["context_mode"] or "on").strip().lower()
-        per_hour = int(route["per_hour"])
-        next_limit = next((x for x in (5, 20, 50, 100) if x > per_hour), 5)
-        next_max = next((x for x in (1000, 2000, 3000, 4000) if x > int(route["max_text"])), 1000)
-        text = (f"🔀 {route['src_alias'] or 'вы'} → {route['dst_alias']}\n\n"
-                f"политика: {policy} "
-                f"({'спрашивать владельца' if policy == 'ask' else 'продолжения без карточки'})\n"
-                f"лимит: {per_hour}/час · max_text: {route['max_text']}\n"
-                f"контекст ветки: {'вкл (последние 5 ходов)' if ctx_mode != 'off' else 'выкл'}\n"
-                f"id: {route['id']}")
-        rows = [
-            [(f"Политика → {'auto' if policy == 'ask' else 'ask'}", f"hub:rpol:{route['id']}")],
-                    [(f"🧠 Контекст → {'выкл' if ctx_mode == 'off' else 'вкл'}",
-                      f"hub:rctx:{route['id']}")],
-            [(f"Лимит → {next_limit}/час", f"hub:rlim:{route['id']}")],
-            [(f"max_text → {next_max}", f"hub:rmax:{route['id']}")],
-            [("🗑 Удалить маршрут", f"hub:rdel:{route['id']}")],
-            *back,
-        ]
-        self.db.event("menu_route", owner=uid, route=int(route["id"]))
-        self._show(uid, chat, msg_id, text, rows)
-
-    # ── внешние клиенты (меню) ───────────────────────────────────────────────
-    def send_link_card(self, uid: int, chat: Any, msg_id: Any, link_id: str) -> None:
-        back = [[("⬅️ Связи", "hub:menu:links"), ("❌ Закрыть", "hub:menu:close")]]
-        row = self.db.one(
-            "SELECT l.*, s.username AS src_username, s.alias AS src_alias, "
-            "s.owner_tg AS src_owner, d.username AS dst_username, d.owner_tg AS dst_owner "
-            "FROM links l JOIN bots s ON s.bot_id=l.src_bot_id "
-            "JOIN bots d ON d.bot_id=l.dst_bot_id WHERE l.id=?",
-            (int(link_id),)) if str(link_id).isdigit() else None
-        if not row or uid not in (int(row["src_owner"]), int(row["dst_owner"])):
-            return self.send_menu_section(uid, chat, msg_id, "links")
-        mine_src = int(row["src_owner"]) == uid
-        text = (f"🔗 Связь #{row['id']}\n"
-                f"@{row['src_username']} → @{row['dst_username']}\n\n"
-                f"исходящие (спрашивать отправителя): {row['policy_src']}\n"
-                f"входящие (спрашивать получателя): {row['policy_dst']}\n\n"
-                "«ask» — карточка владельцу, «auto» — без карточки.\n"
-                "Свою сторону меняете вы, чужую — её владелец.")
-        rows = []
-        if mine_src:
-            rows.append([(f"Исходящие → {'auto' if row['policy_src'] == 'ask' else 'ask'}",
-                          f"hub:lpol:{row['id']}:src")])
-        if int(row["dst_owner"]) == uid:
-            rows.append([(f"Входящие → {'auto' if row['policy_dst'] == 'ask' else 'ask'}",
-                          f"hub:lpol:{row['id']}:dst")])
-        rows.extend(back)
-        self.db.event("menu_link", owner=uid, link=int(row["id"]))
-        self._show(uid, chat, msg_id, text, rows)
-
-    def toggle_link_policy(self, uid: int, chat: Any, msg_id: Any, payload: str) -> None:
-        link_id, _, which = payload.partition(":")
-        row = self.db.one(
-            "SELECT l.*, s.owner_tg AS src_owner, d.owner_tg AS dst_owner "
-            "FROM links l JOIN bots s ON s.bot_id=l.src_bot_id "
-            "JOIN bots d ON d.bot_id=l.dst_bot_id WHERE l.id=?",
-            (int(link_id),)) if link_id.isdigit() else None
-        if not row:
-            return self.send_menu_section(uid, None, msg_id, "links")
-        if which == "src" and int(row["src_owner"]) != uid:
-            return self.send_link_card(uid, chat, msg_id, link_id)
-        if which == "dst" and int(row["dst_owner"]) != uid:
-            return self.send_link_card(uid, chat, msg_id, link_id)
-        current = str(row["policy_src"] if which == "src" else row["policy_dst"])
-        self.db.set_link_policy(int(link_id), which, "auto" if current == "ask" else "ask")
-        self.db.event("link_policy_changed", owner=uid, link=int(link_id), which=which)
-        self.send_link_card(uid, chat, msg_id, link_id)
-
-    def send_client_card(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
-        back = [[("⬅️ Клиенты", "hub:menu:clients"), ("❌ Закрыть", "hub:menu:close")]]
-        row = self.db.client(uid, client_id)
-        if not row:
-            return self._show(uid, chat, msg_id, "Клиент не найден.", back)
-        bots = [b["alias"] for b in self.db.bots(uid)]
-        allowed = clientlib.parse_bots(row["bots"])
-        marks = "все" if allowed is None else (", ".join(sorted(allowed)) or "— ни один —")
-        hour = self.db.client_task_count(client_id, 3600)
-        day = self.db.client_task_count(client_id, 86400)
-        seen = row["last_seen_at"]
-        seen_s = (time.strftime("%d.%m %H:%M", time.localtime(float(seen))) if seen else "не было")
-        expires = row["expires_at"]
-        expires_s = self._expiry_label(expires)
-        state = "активен" if int(row["enabled"]) and not row["revoked_at"] else "отозван"
-        text = (f"🔑 {row['name'] or client_id}  ({client_id})\n"
-                f"токен: {row['token_prefix']}      состояние: {state}\n"
-                f"боты: {marks}\n"
-                f"политика: {row['policy']} · max_text {row['max_text']} · "
-                f"{row['per_min']}/мин · {row['per_hour']}/час\n"
-                f"запросов: {hour}/час, {day}/сутки · последний: {seen_s}\n"
-                f"срок: {expires_s}")
-        rows = [[(f"{'✅' if allowed is None or b in (allowed or ()) else '⬜'} {b}",
-                  f"hub:cbot:{client_id}:{b}")] for b in bots] or []
-        rows.append([("✏️ Имя", f"hub:cname:{client_id}"),
-                     (f"Политика → {self._next_client_policy(row['policy'])}", f"hub:cpol:{client_id}")])
-        rows.append([(f"max_text → {self._next_num(int(row['max_text']), (2000, 3000, 4000, 5000))}",
-                      f"hub:cmax:{client_id}"),
-                     (f"час → {self._next_num(int(row['per_hour']), (50, 100, 200, 500))}",
-                      f"hub:cph:{client_id}")])
-        rows.append([(f"📅 Срок → {self._next_expiry_label(expires)}", f"hub:cexp:{client_id}")])
-        rows.append([("🔄 Ротация токена", f"hub:crot:{client_id}"),
-                     ("⛔ Отозвать", f"hub:crev:{client_id}")])
-        rows.extend(back)
-        self.db.event("menu_client", owner=uid, client=client_id)
-        self._show(uid, chat, msg_id, text, rows)
-
-    @staticmethod
-    def _next_client_policy(current: str) -> str:
-        order = ["inherit", "ask", "auto"]
-        return order[(order.index(current) + 1) % 3] if current in order else "inherit"
-
-    @staticmethod
-    def _next_num(current: int, options: tuple) -> int:
-        return next((x for x in options if x > current), options[0])
-
-    EXPIRY_PRESETS = (7, 30, 90)          # дни; None = бессрочно
-
-    @staticmethod
-    def _expiry_label(expires: Any) -> str:
-        if not expires:
-            return "бессрочно"
-        left = (float(expires) - time.time()) / 86400
-        stamp = time.strftime("%d.%m.%Y", time.localtime(float(expires)))
-        if left <= 0:
-            return f"истёк {stamp}"
-        return f"до {stamp} ({int(left)} дн)" if left >= 1 else f"до {stamp} (<1 дн)"
-
-    def _next_expiry_days(self, expires: Any) -> Optional[int]:
-        """Бессрочно → 7 → 30 → 90 → бессрочно."""
-        if not expires:
-            return self.EXPIRY_PRESETS[0]
-        left = (float(expires) - time.time()) / 86400
-        for days in self.EXPIRY_PRESETS:
-            if left < days:
-                nxt = [d for d in self.EXPIRY_PRESETS if d > days]
-                return nxt[0] if nxt else None
-        return None
-
-    def _next_expiry_label(self, expires: Any) -> str:
-        days = self._next_expiry_days(expires)
-        return f"{days} дн" if days else "бессрочно"
-
-    def cycle_client_expiry(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
-        row = self.db.client(uid, client_id)
-        if not row:
-            return self.send_menu_section(uid, None, msg_id, "clients")
-        days = self._next_expiry_days(row["expires_at"])
-        expires_at = time.time() + days * 86400 if days else None
-        self.db.update_client(client_id, expires_at=expires_at)
-        self.db.event("client_expiry_changed", owner=uid, client=client_id, days=days)
-        self.send_client_card(uid, None, msg_id, client_id)
-
-    def begin_client_rename(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
-        if not self.db.client(uid, client_id):
-            return self.send_menu_section(uid, None, msg_id, "clients")
-        self.db.set_state(uid, "client_name", client_id)
-        self._show(uid, chat, msg_id,
-                   "Пришлите новое имя клиента (до 60 символов). /cancel — отменить.",
-                   [[("⬅️ Клиенты", "hub:menu:clients"), ("❌ Закрыть", "hub:menu:close")]])
-
-    def toggle_client_bot(self, uid: int, chat: Any, msg_id: Any, payload: str) -> None:
-        client_id, _, alias = payload.partition(":")
-        row = self.db.client(uid, client_id)
-        if not row or not alias:
-            return self.send_menu_section(uid, None, msg_id, "clients")
-        all_bots = [b["alias"] for b in self.db.bots(uid)]
-        allowed = clientlib.parse_bots(row["bots"])
-        current = set(all_bots) if allowed is None else set(allowed)
-        current.symmetric_difference_update({alias})      # toggle
-        field = "*" if current >= set(all_bots) else clientlib.dump_bots(current)
-        self.db.update_client(client_id, bots=field)
-        self.db.event("client_bots_changed", owner=uid, client=client_id, bots=field)
-        self.send_client_card(uid, None, msg_id, client_id)
-
-    def cycle_client_setting(self, uid: int, chat: Any, msg_id: Any, payload: str,
-                             kind: str) -> None:
-        client_id, _, _ = payload.partition(":")
-        row = self.db.client(uid, client_id)
-        if not row:
-            return self.send_menu_section(uid, None, msg_id, "clients")
-        if kind == "cpol":
-            self.db.update_client(client_id, policy=self._next_client_policy(row["policy"]))
-        elif kind == "cmax":
-            self.db.update_client(client_id,
-                                  max_text=self._next_num(int(row["max_text"]),
-                                                          (2000, 3000, 4000, 5000)))
-        else:
-            self.db.update_client(client_id,
-                                  per_hour=self._next_num(int(row["per_hour"]),
-                                                          (50, 100, 200, 500)))
-        self.db.event("client_updated", owner=uid, client=client_id, what=kind)
-        self.send_client_card(uid, None, msg_id, client_id)
-
-    def confirm_client_rotate(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
-        row = self.db.client(uid, client_id)
-        if not row:
-            return self.send_menu_section(uid, None, msg_id, "clients")
-        self._show(uid, chat, msg_id,
-                   f"Ротировать токен клиента «{row['name'] or client_id}»?\n"
-                   "Старый токен перестанет работать сразу.",
-                   [[("🔄 Да, ротировать", f"hub:croty:{client_id}")],
-                    [("⬅️ Назад", f"hub:cl:{client_id}"), ("❌ Закрыть", "hub:menu:close")]])
-
-    def do_client_rotate(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
-        token = self.db.rotate_client_token(uid, client_id)
-        if not token:
-            return self.send_menu_section(uid, None, msg_id, "clients")
-        self.db.event("client_token_rotated", owner=uid, client=client_id)
-        self.say(uid, f"🔑 Новый токен клиента {client_id} (показывается один раз):\n\n"
-                      f"{token}\n\nСтарый больше не работает.")
-        self.send_client_card(uid, None, None, client_id)
-
-    def confirm_client_revoke(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
-        row = self.db.client(uid, client_id)
-        if not row:
-            return self.send_menu_section(uid, None, msg_id, "clients")
-        self._show(uid, chat, msg_id,
-                   f"Отозвать клиента «{row['name'] or client_id}»?\n"
-                   "Его задачи останутся, доступ закроется сразу.",
-                   [[("⛔ Да, отозвать", f"hub:crevy:{client_id}")],
-                    [("⬅️ Назад", f"hub:cl:{client_id}"), ("❌ Закрыть", "hub:menu:close")]])
-
-    def do_client_revoke(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
-        self.db.revoke_client(uid, client_id)
-        self.db.event("client_revoked", owner=uid, client=client_id)
-        self.send_client_card(uid, None, msg_id, client_id)
-
-    def toggle_context(self, uid: int, chat: Any, msg_id: Any, route_id: str) -> None:
-        route = self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
-                            (int(route_id), uid)) if str(route_id).isdigit() else None
-        if not route:
-            return self.send_menu_section(uid, None, msg_id, "routes")
-        new_mode = "on" if str(route["context_mode"] or "on").strip().lower() == "off" else "off"
-        self.db.set_context_mode(uid, int(route["id"]), new_mode)
-        self.db.event("route_context_changed", owner=uid, route=int(route["id"]), mode=new_mode)
-        self.send_route(uid, None, msg_id, route_id)
-
-    def toggle_route(self, uid: int, chat: Any, msg_id: Any, route_id: str, kind: str) -> None:
-        route = self.db.one("SELECT * FROM routes WHERE id=? AND owner_tg=?",
-                            (int(route_id), uid)) if str(route_id).isdigit() else None
-        if not route:
-            return self.send_route(uid, chat, msg_id, route_id)
-        policy = str(route["policy"])
-        per_hour = int(route["per_hour"])
-        max_text = int(route["max_text"])
         if kind == "rpol":
             policy = "auto" if policy == "ask" else "ask"
         elif kind == "rlim":
@@ -1657,7 +890,6 @@ class Hub:
         view = rpc.task_view(task)
         created = time.strftime("%d.%m %H:%M", time.localtime(float(task["created_at"])))
         keys = task.keys() if hasattr(task, "keys") else ()
-        cid = task["client_id"] if "client_id" in keys else None
         who = f" · клиент {cid}" if cid else ""
         lines = [f"🗂 {task['task_id']}   {task['src_alias']} → {task['dst_alias']}{who}",
                  f"состояние: {view['status']['state']} ({task['status']}) · "
@@ -1768,24 +1000,6 @@ class Hub:
                 rows = [[(f"{r['task_id']} · {r['src_alias']}→{r['dst_alias']} · {r['status']}",
                           f"hub:task:{r['task_id']}")] for r in found] or []
                 rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
-            elif section == "clients":
-                found = self.db.clients(uid)
-                text = ("Внешние A2A-клиенты — нажмите для настройки:"
-                        if found else "Клиентов нет — внешние A2A подключаются только "
-                                      "по токену владельца.")
-                rows = [[(f"{'🟢' if int(r['enabled']) else '⚪️'} {r['name'] or r['client_id']} · "
-                          f"{r['token_prefix']} · {r['per_hour']}/час",
-                          f"hub:cl:{r['client_id']}")] for r in found] or []
-                rows.append([("➕ Новый клиент", "hub:new:client")])
-                rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
-            elif section == "links":
-                found = self.db.links_for_owner(uid)
-                text = ("Связи — нажмите, чтобы настроить политики:" if found
-                        else "Связей нет. /share <алиас>")
-                rows = [[(f"🔗 #{r['id']} @{r['src_username']} → @{r['dst_username']} "
-                          f"({r['policy_src']}/{r['policy_dst']})", f"hub:lnk:{r['id']}")]
-                        for r in found] or []
-                rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
             elif section == "protocol":
                 text = protocol.AGENT_PROTOCOL
             else:
@@ -1839,15 +1053,6 @@ def main() -> int:
               open_registration=open_reg, proxy=proxy)
     print(f"hub: db={db_path} owners={sorted(hub.owners)} proxy={'yes' if proxy else 'no'}",
           flush=True)
-    a2a_port = int(os.environ.get("TG_GATEWAY_A2A_PORT") or 0)
-    if a2a_port:
-        from . import a2a_http
-        a2a_http.start(hub, port=a2a_port,
-                       token=(os.environ.get("TG_GATEWAY_A2A_TOKEN") or "").strip() or None,
-                       host=(os.environ.get("TG_GATEWAY_A2A_HOST") or "127.0.0.1").strip())
-        print(f"hub: A2A http на :{a2a_port} (Bearer "
-              f"{'включён' if os.environ.get('TG_GATEWAY_A2A_TOKEN') else 'выключен'})",
-              flush=True)
     if hub.install_commands():
         print("hub: команды опубликованы в Telegram (автодополнение включено)", flush=True)
     hub.run()

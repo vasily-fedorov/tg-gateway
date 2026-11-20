@@ -84,12 +84,12 @@ def is_continuation(*, ctx: str, hops: int) -> bool:
 def needs_approval(*, policy: str, ctx: str, hops: int, direction: str) -> bool:
     """Спрашивать владельца?
 
-    - новый исходящий запрос (нет ctx) → да, всегда;
+    - новый исходящий запрос (нет ctx) → да, если политика маршрута не auto;
     - ответ/продолжение в рамках ctx → только если маршрут помечен policy=ask;
     - policy=auto разрешает продолжения без карточки.
     """
     if not is_continuation(ctx=ctx, hops=hops):
-        return True
+        return policy != "auto"
     if direction == "reply":
         return policy != "auto"
     return policy == "ask"
