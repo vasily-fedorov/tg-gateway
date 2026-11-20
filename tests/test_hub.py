@@ -441,11 +441,12 @@ def run() -> dict:
     assert again["result"]["task"]["id"] == task_view["id"], again
     res["rpc_idempotent_message_id"] = True
 
-    # agent/card отдаёт навыки
+    # agent/card: своя карточка + агенты владельца (компактно, без полных карточек)
     card = rpc_call("r3", "agent/card", {})["result"]
-    names = [s["id"] for s in card["card"]["skills"]]
+    assert card["card"]["name"] == "@god", card["card"]["name"]  # спрашивал бот god
+    names = [a["alias"] for a in card["agents"]]
     assert names == ["aa", "god"], names
-    assert "смотреть диск" in [s for s in card["card"]["skills"] if s["id"] == "aa"][0]["description"]
+    assert "смотреть диск" in [a for a in card["agents"] if a["alias"] == "aa"][0]["description"]
     one = rpc_call("r4", "agent/card", {"alias": "aa"})["result"]["card"]
     assert one["name"] == "@aa" and one["capabilities"]["humanApproval"] is True, one
     res["rpc_agent_card"] = True

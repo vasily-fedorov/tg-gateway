@@ -390,12 +390,17 @@ class Hub:
                 return self.say(bot_id, rpc.rpc_ok(rpc_id, {
                     "card": rpc.bot_card(peer, owner),
                     "routes": self.routes_for_bot(owner, str(me["alias"])) if me else []}))
+            # Компактный ответ: карточка спрашивающего + агенты + маршруты.
+            # Полные карточки всех ботов не шлём — сообщение Telegram ограничено 4096
+            # символами, а обрезанный JSON ломает разбор на стороне агента.
             me = self.db.bot_by_id(bot_id)
-            routes = self.routes_for_bot(owner, str(me["alias"])) if me else []
+            bots = self.db.bots(owner)
             return self.say(bot_id, rpc.rpc_ok(rpc_id, {
-                "card": rpc.hub_card(owner, self.db.bots(owner)),
-                "cards": [rpc.bot_card(b, owner) for b in self.db.bots(owner)],
-                "routes": routes}))
+                "card": rpc.bot_card(me, owner) if me else {},
+                "agents": [{"alias": b["alias"], "username": b["username"],
+                            "description": (b["description"] or "")[:160]} for b in bots],
+                "routes": self.routes_for_bot(owner, str(me["alias"])) if me else [],
+                "protocolVersion": rpc.PROTOCOL_VERSION}))
 
         if method in ("message/send", "message/stream"):
             msg = params.get("message") or {}
