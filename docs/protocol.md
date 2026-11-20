@@ -255,6 +255,20 @@ sha256 и префикс. Настраивается: разрешённые б�
 `CARD_TTL_S` (20 мин) она протухает: `card_expired` + `card_expired_peer`, а отправителю
 уходит «Получатель не ответил за 20 минут».
 
+## 10b. Видимость маршрутов (routes_mode)
+
+У каждого бота есть режим видимости адресатов:
+
+- `all` (по умолчанию) — бот видит всех включённых ботов владельца; адресат без явного
+  маршрута доступен с политикой `ask`;
+- `explicit` — бот видит **только себя и тех, на кого есть явный маршрут**. Скрытые боты
+  не попадают ни в `agent/card.agents`, ни в `routes`, и отправить им нельзя: хаб отвечает
+  «нет маршрута» и пишет событие `hidden_dst_refused` (существование адресата не
+  подтверждается).
+
+Переключается в меню «🤖 Боты» → карточка бота → «👁 Маршруты». Так один владелец может
+держать несколько независимых групп: бот A не знает о существовании бота C, хотя оба его.
+
 ## 11. Аудит
 
 Хаб: таблица `events` (`relay_parked`, `card_approved`, `delivered`, `reply_parked`,
@@ -262,7 +276,7 @@ sha256 и префикс. Настраивается: разрешённые б�
 `client_created`, `client_auth`, `client_denied`, `client_rate_limited`,
 `client_token_rotated`, `client_revoked`, `client_expiry_changed`, `client_bots_changed`,
 `route_context_changed`, `menu_*`,
-`link_policy_changed`, `cross_inbound_parked`, `cross_inbound_approved`,
+`bot_routes_mode_changed`, `hidden_dst_refused`, `link_policy_changed`, `cross_inbound_parked`, `cross_inbound_approved`,
 `cross_inbound_rejected`, `card_expired_peer`,
 `task_skipped`, `ttl_rejected`, `rpc_dedup`, `rpc_dedup_fingerprint`, `hop_limit`,
 `peer_blocked`, `peer_circuit_open`, `card_unauthorized`, `hub_error`).

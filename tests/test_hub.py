@@ -445,7 +445,7 @@ def run() -> dict:
     card = rpc_call("r3", "agent/card", {})["result"]
     assert card["card"]["name"] == "@god", card["card"]["name"]  # спрашивал бот god
     names = [a["alias"] for a in card["agents"]]
-    assert names == ["aa", "god"], names
+    assert names == ["god", "aa"], names       # сначала сам, затем адресаты
     assert "смотреть диск" in [a for a in card["agents"] if a["alias"] == "aa"][0]["description"]
     one = rpc_call("r4", "agent/card", {"alias": "aa"})["result"]["card"]
     assert one["name"] == "@aa" and one["capabilities"]["humanApproval"] is True, one
@@ -1425,6 +1425,44 @@ def run() -> dict:
     card, _ = hub.http_rpc("agent/card", {"alias": "aa"})
     assert card["routes"][0]["alias"] == "god", card
     res["agent_card_routes"] = True
+
+    # 10z3. скрытый бот: в строгом режиме aa не видит и не может писать тому, на кого нет маршрута
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=AA, alias="aa")
+    pair(hub, tg, bot_id=GOD, alias="god")
+    BOT_C = 555000333
+    tg.sent.clear()
+    hub.handle(msg(OWNER, "/pair bee"))
+    code_c = [ln for ln in tg.sent[-1]["text"].splitlines() if ln.startswith("/pair ")][0]
+    hub.handle(msg(BOT_C, code_c, is_bot=True, username="bee_bot"))
+    # явный маршрут bee → god, но не aa → bee
+    hub.db.set_route(OWNER, "bee", "god", policy="ask")
+    hub.db.set_routes_mode(OWNER, "aa", "explicit")
+
+    card = hub.http_rpc("agent/card", {"alias": "aa"})[0]
+    visible = [a["alias"] for a in card["routes"]]
+    assert visible == [], visible            # у aa нет явных маршрутов
+    agents = [a["alias"] for a in hub.visible_agents(OWNER, "aa")]
+    assert agents == ["aa"], agents          # bee и god скрыты
+
+    # строгий режим не даёт отправить скрытому адресату
+    tg.sent.clear()
+    hub.handle(msg(AA, json.dumps({"jsonrpc": "2.0", "id": "h1", "method": "message/send",
+                                   "params": {"to": "bee",
+                                              "message": {"role": "user", "messageId": "m-h",
+                                                          "parts": [{"kind": "text",
+                                                                     "text": "привет"}]}}}),
+                   is_bot=True, username="aa"))
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='hidden_dst_refused'"), "должен быть отказ"
+    assert not hub.db.q("SELECT 1 FROM tasks WHERE dst_alias='bee'"), "задача не создаётся"
+
+    # bee видит god (есть маршрут), а aa для него скрыт по умолчанию (режим all) — но в strict тоже
+    hub.db.set_routes_mode(OWNER, "bee", "explicit")
+    assert [a["alias"] for a in hub.visible_agents(OWNER, "bee")] == ["bee", "god"]
+    # вернули aa в обычный режим — снова видит всех
+    hub.db.set_routes_mode(OWNER, "aa", "all")
+    assert {a["alias"] for a in hub.visible_agents(OWNER, "aa")} == {"aa", "god", "bee"}
+    res["bot_routes_mode_strict"] = True
 
     # старый самодельный конверт больше не принимается
     hub, tg = new_hub()

@@ -151,6 +151,8 @@ class Db:
             self.run("ALTER TABLE bots ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         if "a2a_policy" not in cols:
             self.run("ALTER TABLE bots ADD COLUMN a2a_policy TEXT NOT NULL DEFAULT ''")
+        if "routes_mode" not in cols:
+            self.run("ALTER TABLE bots ADD COLUMN routes_mode TEXT NOT NULL DEFAULT 'all'")
         rcols = {r["name"] for r in self.q("PRAGMA table_info(routes)")}
         if "context_mode" not in rcols:
             self.run("ALTER TABLE routes ADD COLUMN context_mode TEXT NOT NULL DEFAULT ''")
@@ -274,6 +276,10 @@ class Db:
     def peer_blocked(self, alias: str) -> float:
         row = self.peer_state(alias)
         return float(row["blocked_until"] or 0.0)
+
+    def set_routes_mode(self, owner: int, alias: str, mode: str) -> None:
+        self.run("UPDATE bots SET routes_mode=? WHERE owner_tg=? AND alias=?",
+                 ("explicit" if mode == "explicit" else "all", owner, alias))
 
     def set_a2a_policy(self, owner: int, alias: str, policy: str) -> None:
         self.run("UPDATE bots SET a2a_policy=? WHERE owner_tg=? AND alias=?",

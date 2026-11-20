@@ -397,8 +397,7 @@ class Hub:
             bots = self.db.bots(owner)
             return self.say(bot_id, rpc.rpc_ok(rpc_id, {
                 "card": rpc.bot_card(me, owner) if me else {},
-                "agents": [{"alias": b["alias"], "username": b["username"],
-                            "description": (b["description"] or "")[:160]} for b in bots],
+                "agents": self.visible_agents(owner, str(me["alias"])) if me else [],
                 "routes": self.routes_for_bot(owner, str(me["alias"])) if me else [],
                 "protocolVersion": rpc.PROTOCOL_VERSION}))
 
@@ -570,6 +569,10 @@ class Hub:
                 target = self.db.bot_by_id(int(link["dst_id"]))
         if not target:
             return self.say(int(bot["bot_id"]), f"Нет бота «{dst_alias}» у владельца.")
+        if (str(bot["routes_mode"] or "all") == "explicit" and not link
+                and not self.db.route(owner, str(bot["alias"]), dst_alias)):
+            self.db.event("hidden_dst_refused", owner=owner, src=str(bot["alias"]), dst=dst_alias)
+            return self.say(int(bot["bot_id"]), f"Нет маршрута к «{dst_alias}».")
         if not policy.hop_allowed(hops):
             self.db.event("hop_limit", owner=owner, hops=hops, src=bot["alias"], dst=dst_alias)
             return self.say(int(bot["bot_id"]), f"Предел глубины ({policy.MAX_HOPS}).")
@@ -808,15 +811,32 @@ class Hub:
 
         return {"message": f"неизвестный метод: {method}"}, rpc.ERR_METHOD_NOT_FOUND
 
+    def _bot_mode(self, owner: int, alias: str) -> str:
+        bot = self.db.bot_by_alias(owner, alias)
+        return str(bot["routes_mode"] or "all") if bot else "all"
+
     def routes_for_bot(self, owner: int, alias: str) -> list:
-        """Куда этому боту можно отправлять: все включённые боты + политика маршрута."""
-        rows = self.db.q(
+        """Куда этому боту можно отправлять.
+
+        `routes_mode='all'` — все включённые боты владельца (текущее поведение);
+        `'explicit'` — только те, на кого есть явный маршрут (скрытые остаются
+        невидимыми и недоступными).
+        """
+        if self._bot_mode(owner, alias) == "explicit":
+            rows = self.db.q(
+                "SELECT b.alias, b.username, b.description, r.policy, r.max_text, "
+                "       r.per_hour, r.context_mode, 1 AS explicit "
+                "FROM routes r JOIN bots b ON b.owner_tg=r.owner_tg AND b.alias=r.dst_alias "
+                "WHERE r.owner_tg=? AND r.src_alias=? AND b.enabled=1 ORDER BY b.alias",
+                (owner, alias))
+        else:
+            rows = self.db.q(
             "SELECT b.alias, b.username, b.description, "
             "       r.policy, r.max_text, r.per_hour, r.context_mode, (r.id IS NOT NULL) AS explicit "
             "FROM bots b LEFT JOIN routes r ON r.owner_tg=b.owner_tg AND r.dst_alias=b.alias "
             "  AND r.src_alias=? "
-            "WHERE b.owner_tg=? AND b.enabled=1 AND b.alias<>? ORDER BY b.alias",
-            (alias, owner, alias))
+                "WHERE b.owner_tg=? AND b.enabled=1 AND b.alias<>? ORDER BY b.alias",
+                (alias, owner, alias))
         out = []
         for r in rows:
             out.append({"alias": r["alias"], "username": r["username"],
@@ -826,6 +846,18 @@ class Hub:
                         "per_hour": int(r["per_hour"] or policy.PER_HOUR),
                         "context": ("off" if str(r["context_mode"] or "") == "off" else "on"),
                         "explicit_route": bool(r["explicit"])})
+        return out
+
+    def visible_agents(self, owner: int, alias: str) -> list:
+        """Кого этот бот имеет право видеть: он сам + разрешённые адресаты."""
+        me = self.db.bot_by_alias(owner, alias)
+        out = []
+        if me:
+            out.append({"alias": me["alias"], "username": me["username"],
+                        "description": (me["description"] or "")[:160], "self": True})
+        for r in self.routes_for_bot(owner, alias):
+            out.append({"alias": r["alias"], "username": r["username"],
+                        "description": (r["description"] or "")[:160], "self": False})
         return out
 
     def _a2a_public_url(self) -> str:
@@ -1014,7 +1046,7 @@ class Hub:
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
                        "desc", "new", "newr", "rdel", "rdelok", "tfull", "a2apol", "rctx",
                        "cl", "cname", "cbot", "cpol", "cmax", "cph", "crot", "croty",
-                       "crev", "crevy", "cexp", "lnk", "lpol"):
+                       "crev", "crevy", "cexp", "lnk", "lpol", "rmode"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -1059,6 +1091,8 @@ class Hub:
                 return self.do_client_revoke(uid, chat_id, msg_id, task_id)
             if verdict == "rctx":
                 return self.toggle_context(uid, chat_id, msg_id, task_id)
+            if verdict == "rmode":
+                return self.toggle_routes_mode(uid, chat_id, msg_id, task_id)
             if verdict == "a2apol":
                 return self.toggle_a2a_policy(uid, chat_id, msg_id, task_id)
             if verdict == "task":
@@ -1303,12 +1337,23 @@ class Hub:
         self._show(uid, chat, msg_id, text,
                    [[("✏️ Изменить описание", f"hub:desc:{alias}")],
                     [(f"🌐 A2A → {'авто' if self._a2a_mode(bot) == 'ask' else 'спрашивать'}",
-                      f"hub:a2apol:{alias}")], *back])
+                      f"hub:a2apol:{alias}")],
+                    [(f"👁 Маршруты → {'только явные' if str(bot['routes_mode'] or 'all') == 'explicit' else 'все боты'}",
+                      f"hub:rmode:{alias}")], *back])
 
     def _a2a_mode(self, bot: Any) -> str:
         mode = (str(bot["a2a_policy"] or "").strip()
                 or (os.environ.get("TG_GATEWAY_A2A_POLICY") or "ask").strip()).lower()
         return mode if mode in ("ask", "auto") else "ask"
+
+    def toggle_routes_mode(self, uid: int, chat: Any, msg_id: Any, alias: str) -> None:
+        bot = self.db.bot_by_alias(uid, alias)
+        if not bot:
+            return self.send_bot_card(uid, chat, msg_id, alias)
+        new_mode = "all" if str(bot["routes_mode"] or "all") == "explicit" else "explicit"
+        self.db.set_routes_mode(uid, alias, new_mode)
+        self.db.event("bot_routes_mode_changed", owner=uid, alias=alias, mode=new_mode)
+        self.send_bot_card(uid, chat, msg_id, alias)
 
     def toggle_a2a_policy(self, uid: int, chat: Any, msg_id: Any, alias: str) -> None:
         bot = self.db.bot_by_alias(uid, alias)
