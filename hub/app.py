@@ -569,7 +569,7 @@ class Hub:
                 target = self.db.bot_by_id(int(link["dst_id"]))
         if not target:
             return self.say(int(bot["bot_id"]), f"Нет бота «{dst_alias}» у владельца.")
-        if (str(bot["routes_mode"] or "all") == "explicit" and not link
+        if (str(bot["routes_mode"] or "explicit") == "explicit" and not link
                 and not self.db.route(owner, str(bot["alias"]), dst_alias)):
             self.db.event("hidden_dst_refused", owner=owner, src=str(bot["alias"]), dst=dst_alias)
             return self.say(int(bot["bot_id"]), f"Нет маршрута к «{dst_alias}».")
@@ -813,7 +813,7 @@ class Hub:
 
     def _bot_mode(self, owner: int, alias: str) -> str:
         bot = self.db.bot_by_alias(owner, alias)
-        return str(bot["routes_mode"] or "all") if bot else "all"
+        return str(bot["routes_mode"] or "explicit") if bot else "explicit"
 
     def routes_for_bot(self, owner: int, alias: str) -> list:
         """Куда этому боту можно отправлять.
@@ -1338,7 +1338,7 @@ class Hub:
                    [[("✏️ Изменить описание", f"hub:desc:{alias}")],
                     [(f"🌐 A2A → {'авто' if self._a2a_mode(bot) == 'ask' else 'спрашивать'}",
                       f"hub:a2apol:{alias}")],
-                    [(f"👁 Маршруты → {'только явные' if str(bot['routes_mode'] or 'all') == 'explicit' else 'все боты'}",
+                    [(f"👁 Маршруты → {'только явные' if str(bot['routes_mode'] or 'explicit') == 'explicit' else 'все боты'}",
                       f"hub:rmode:{alias}")], *back])
 
     def _a2a_mode(self, bot: Any) -> str:
@@ -1350,7 +1350,7 @@ class Hub:
         bot = self.db.bot_by_alias(uid, alias)
         if not bot:
             return self.send_bot_card(uid, chat, msg_id, alias)
-        new_mode = "all" if str(bot["routes_mode"] or "all") == "explicit" else "explicit"
+        new_mode = "all" if str(bot["routes_mode"] or "explicit") == "explicit" else "explicit"
         self.db.set_routes_mode(uid, alias, new_mode)
         self.db.event("bot_routes_mode_changed", owner=uid, alias=alias, mode=new_mode)
         self.send_bot_card(uid, chat, msg_id, alias)

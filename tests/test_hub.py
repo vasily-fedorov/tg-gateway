@@ -76,10 +76,15 @@ def new_hub(open_registration: bool = True) -> tuple[Hub, FakeTg]:
     return hub, tg
 
 
-def pair(hub: Hub, tg: FakeTg, *, bot_id: int, alias: str) -> None:
+def pair(hub: Hub, tg: FakeTg, *, bot_id: int, alias: str,
+         routes_mode: str = "all") -> None:
+    """Привязка бота. В тестах по умолчанию режим 'all' (как было до strict);
+    production-дефолт — 'explicit', он проверяется отдельным тестом."""
     hub.handle(msg(OWNER, f"/pair {alias}"))
     code = [ln for ln in tg.sent[-1]["text"].splitlines() if ln.startswith("/pair ")][0]
     hub.handle(msg(bot_id, code, is_bot=True, username=alias))
+    if routes_mode != "explicit":
+        hub.db.set_routes_mode(OWNER, alias, routes_mode)
 
 
 def send_relay(hub: Hub, text: str, to: str = "aa", *, bot_id: int = GOD,
@@ -1428,8 +1433,8 @@ def run() -> dict:
 
     # 10z3. скрытый бот: в строгом режиме aa не видит и не может писать тому, на кого нет маршрута
     hub, tg = new_hub()
-    pair(hub, tg, bot_id=AA, alias="aa")
-    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa", routes_mode="explicit")
+    pair(hub, tg, bot_id=GOD, alias="god", routes_mode="explicit")
     BOT_C = 555000333
     tg.sent.clear()
     hub.handle(msg(OWNER, "/pair bee"))
