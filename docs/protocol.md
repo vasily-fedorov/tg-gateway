@@ -228,6 +228,22 @@ sha256 и префикс. Настраивается: разрешённые б�
 Сессии задач одного клиента не видны другому. Истёкший или отозванный токен → 401,
 событие `client_denied` с причиной (`bot`/`revoked`/`expired`).
 
+## 10a. Кросс-владельческие связи: две карточки
+
+Когда бот A (владелец 1) пишет боту B (владелец 2) по связи `/share` + `/link`, при
+`ask` подтверждают **оба**:
+
+1. владелец 1 — карточка «Переслать агенту @B?» (`card_approved` → `after_src_approval`);
+2. владелец 2 — карточка «Входящее от чужого владельца» (`cross_inbound_parked`);
+   «Принять» → `deliver`, «Отклонить» → `rejected` + уведомление отправителю.
+
+Политики связи (`links.policy_src`, `links.policy_dst`) переключаются в меню «🔗 Связи»:
+каждая сторона меняет только свою. `auto` убирает карточку на соответствующем шаге.
+
+Пока получатель не ответил, задача имеет статус `submitted` (не доставлена). Через
+`CARD_TTL_S` (20 мин) она протухает: `card_expired` + `card_expired_peer`, а отправителю
+уходит «Получатель не ответил за 20 минут».
+
 ## 11. Аудит
 
 Хаб: таблица `events` (`relay_parked`, `card_approved`, `delivered`, `reply_parked`,
@@ -235,6 +251,8 @@ sha256 и префикс. Настраивается: разрешённые б�
 `client_created`, `client_auth`, `client_denied`, `client_rate_limited`,
 `client_token_rotated`, `client_revoked`, `client_expiry_changed`, `client_bots_changed`,
 `route_context_changed`, `menu_*`,
+`link_policy_changed`, `cross_inbound_parked`, `cross_inbound_approved`,
+`cross_inbound_rejected`, `card_expired_peer`,
 `task_skipped`, `ttl_rejected`, `rpc_dedup`, `rpc_dedup_fingerprint`, `hop_limit`,
 `peer_blocked`, `peer_circuit_open`, `card_unauthorized`, `hub_error`).
 Агент: `logs/gateway-relay-audit.jsonl` (`hub_inbound`, `rpc_tasks_update`,

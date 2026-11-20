@@ -344,6 +344,48 @@ def run() -> dict:
     assert got and got[-1]["text"] == "привет B", got
     res["cross_owner_link_flow"] = True
 
+    # 10g2. меню «Связи»: каждая сторона переключает только свою политику
+    links = hub.db.links_for_owner(OWNER)
+    link_id = int(links[0]["id"])
+    hub.handle(cb(OWNER, f"hub:lnk:{link_id}", message_id=88))
+    card = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]
+    assert "Связь #" in card["text"] and "исходящие" in card["text"], card["text"]
+    flat = [b[1] for r in card["buttons"] for b in r]
+    assert f"hub:lpol:{link_id}:src" in flat and f"hub:lpol:{link_id}:dst" not in flat, flat
+    hub.handle(cb(OWNER, f"hub:lpol:{link_id}:src", message_id=88))
+    assert hub.db.link_by_id(link_id)["policy_src"] == "auto"
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='link_policy_changed'")
+    # чужая сторона: A не может переключить политику входящих B
+    hub.handle(cb(OWNER, f"hub:lpol:{link_id}:dst", message_id=88))
+    assert hub.db.link_by_id(link_id)["policy_dst"] == "ask", "A не должен менять чужую политику"
+    hub.handle(cb(OWNER_B, f"hub:lpol:{link_id}:dst", message_id=89))
+    assert hub.db.link_by_id(link_id)["policy_dst"] == "auto"
+    res["menu_link_policy"] = True
+
+    # 10g3. получатель не ответил за 20 минут → отправитель получает уведомление
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    hub.handle(msg(OWNER_B, "/start"))
+    hub.handle(msg(OWNER_B, "/pair bee"))
+    code_b = [ln for ln in tg.sent[-1]["text"].splitlines() if ln.startswith("/pair ")][0]
+    hub.handle(msg(BOT_B, code_b, is_bot=True, username="owner_b_bot"))
+    hub.handle(msg(OWNER_B, "/share bee"))
+    invite = [x for x in tg.sent if x["chat"] == OWNER_B][-1]["text"]
+    link_code = [w for w in invite.split() if w.startswith("LINK-")][0]
+    hub.handle(msg(OWNER, f"/link {link_code} god"))
+    send_relay(hub, "неотвеченное", to="@owner_b_bot")
+    task_id = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]["buttons"][0][0][1].split(":")[2]
+    hub.handle(cb(OWNER, f"hub:ok:{task_id}"))
+    assert hub.db.task(task_id)["status"] == "submitted"
+    hub.db.run("UPDATE tasks SET created_at = created_at - 2000 WHERE task_id=?", (task_id,))
+    tg.sent.clear()
+    hub.expire_all()
+    assert hub.db.task(task_id)["status"] == "failed"
+    assert hub.db.q("SELECT 1 FROM events WHERE kind='card_expired_peer' AND task_id=?", (task_id,))
+    notes = [x["text"] for x in tg.sent if x["chat"] == OWNER and "не ответил" in x["text"]]
+    assert notes and task_id in notes[-1], tg.sent[-3:]
+    res["cross_card_expiry_notify"] = True
+
     # 10h. отказ получателя и разрыв связи
     send_relay(hub, "второе", to="@owner_b_bot")
     t2 = [x for x in tg.sent if x["chat"] == OWNER and x["buttons"]][-1]

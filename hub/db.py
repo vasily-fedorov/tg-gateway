@@ -324,6 +324,11 @@ class Db:
             "FROM links l JOIN bots s ON s.bot_id=l.src_bot_id JOIN bots d ON d.bot_id=l.dst_bot_id "
             "WHERE s.owner_tg=? OR d.owner_tg=? ORDER BY l.id", (owner, owner))
 
+    def set_link_policy(self, link_id: int, which: str, value: str) -> None:
+        column = "policy_src" if which == "src" else "policy_dst"
+        self.run(f"UPDATE links SET {column}=? WHERE id=?",
+                 (value if value in ("ask", "auto") else "ask", int(link_id)))
+
     def drop_link(self, link_id: int) -> None:
         self.run("DELETE FROM links WHERE id=?", (link_id,))
 
@@ -475,10 +480,18 @@ class Db:
         return int(row["n"]) if row else 0
 
     def expire(self, owner: int) -> List[sqlite3.Row]:
-        """Протухшие карточки: submitted старше CARD_TTL_S → failed(card_expired)."""
+        """Протухшие карточки: submitted старше CARD_TTL_S → failed(card_expired).
+
+        Для кросс-владельческих входящих помечаем `expired_peer=True`: вызывающий
+        уведомит отправителя, что получатель не ответил (card_expired_peer).
+        """
         stale = self.q("SELECT * FROM tasks WHERE owner_tg=? AND status='submitted' "
                        "AND created_at < ?", (owner, now() - CARD_TTL_S))
         for row in stale:
             self.update_task(row["task_id"], status="failed")
             self.event("card_expired", task_id=row["task_id"], owner=owner)
+            peer = self.one("SELECT 1 FROM events WHERE task_id=? AND kind='cross_inbound_parked'",
+                            (row["task_id"],))
+            if peer:
+                self.event("card_expired_peer", task_id=row["task_id"], owner=owner)
         return stale

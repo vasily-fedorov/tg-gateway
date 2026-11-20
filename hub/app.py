@@ -83,7 +83,16 @@ class Hub:
 
     def expire_all(self) -> None:
         for row in self.db.q("SELECT tg_id FROM owners"):
-            self.db.expire(row["tg_id"])
+            owner = int(row["tg_id"])
+            expired = list(self.db.expire(owner) or [])
+            for task in expired:
+                parked = self.db.one(
+                    "SELECT 1 FROM events WHERE task_id=? AND kind='card_expired_peer'",
+                    (task["task_id"],))
+                if not parked:
+                    continue
+                self.say(owner, f"⌛ Получатель не ответил за 20 минут: задача {task['task_id']} "
+                                f"→ {task['dst_alias']} не доставлена.")
 
     # ── диспетчер ────────────────────────────────────────────────────────────
     def handle(self, update: Dict[str, Any]) -> None:
@@ -591,6 +600,9 @@ class Hub:
         if not task:
             return
         if link and str(link["policy_dst"]) == "ask":
+            # Ещё не доставлено: ждём карточку получателя, значит снова submitted
+            # (иначе задача висит в working и не попадает в TTL карточек).
+            self.db.update_task(task_id, status="submitted")
             dst_owner = int(link["dst_owner"])
             preview = str(task["text"] or "").replace("\n", " ")[:300]
             ok, res = self.tg.send(
@@ -970,7 +982,7 @@ class Hub:
         if verdict in ("card", "route", "rpol", "rlim", "rmax", "task", "tcancel",
                        "desc", "new", "newr", "rdel", "rdelok", "tfull", "a2apol", "rctx",
                        "cl", "cname", "cbot", "cpol", "cmax", "cph", "crot", "croty",
-                       "crev", "crevy", "cexp"):
+                       "crev", "crevy", "cexp", "lnk", "lpol"):
             self.tg.answer_callback(cb_id, "")
             if verdict == "card":
                 return self.send_bot_card(uid, chat_id, msg_id, task_id)
@@ -991,6 +1003,10 @@ class Hub:
                 return self.do_route_delete(uid, chat_id, msg_id, task_id)
             if verdict == "tfull":
                 return self.send_task_full(uid, chat_id, task_id)
+            if verdict == "lnk":
+                return self.send_link_card(uid, chat_id, msg_id, task_id)
+            if verdict == "lpol":
+                return self.toggle_link_policy(uid, chat_id, msg_id, task_id)
             if verdict == "cl":
                 return self.send_client_card(uid, chat_id, msg_id, task_id)
             if verdict == "cname":
@@ -1301,6 +1317,52 @@ class Hub:
         self._show(uid, chat, msg_id, text, rows)
 
     # ── внешние клиенты (меню) ───────────────────────────────────────────────
+    def send_link_card(self, uid: int, chat: Any, msg_id: Any, link_id: str) -> None:
+        back = [[("⬅️ Связи", "hub:menu:links"), ("❌ Закрыть", "hub:menu:close")]]
+        row = self.db.one(
+            "SELECT l.*, s.username AS src_username, s.alias AS src_alias, "
+            "s.owner_tg AS src_owner, d.username AS dst_username, d.owner_tg AS dst_owner "
+            "FROM links l JOIN bots s ON s.bot_id=l.src_bot_id "
+            "JOIN bots d ON d.bot_id=l.dst_bot_id WHERE l.id=?",
+            (int(link_id),)) if str(link_id).isdigit() else None
+        if not row or uid not in (int(row["src_owner"]), int(row["dst_owner"])):
+            return self.send_menu_section(uid, chat, msg_id, "links")
+        mine_src = int(row["src_owner"]) == uid
+        text = (f"🔗 Связь #{row['id']}\n"
+                f"@{row['src_username']} → @{row['dst_username']}\n\n"
+                f"исходящие (спрашивать отправителя): {row['policy_src']}\n"
+                f"входящие (спрашивать получателя): {row['policy_dst']}\n\n"
+                "«ask» — карточка владельцу, «auto» — без карточки.\n"
+                "Свою сторону меняете вы, чужую — её владелец.")
+        rows = []
+        if mine_src:
+            rows.append([(f"Исходящие → {'auto' if row['policy_src'] == 'ask' else 'ask'}",
+                          f"hub:lpol:{row['id']}:src")])
+        if int(row["dst_owner"]) == uid:
+            rows.append([(f"Входящие → {'auto' if row['policy_dst'] == 'ask' else 'ask'}",
+                          f"hub:lpol:{row['id']}:dst")])
+        rows.extend(back)
+        self.db.event("menu_link", owner=uid, link=int(row["id"]))
+        self._show(uid, chat, msg_id, text, rows)
+
+    def toggle_link_policy(self, uid: int, chat: Any, msg_id: Any, payload: str) -> None:
+        link_id, _, which = payload.partition(":")
+        row = self.db.one(
+            "SELECT l.*, s.owner_tg AS src_owner, d.owner_tg AS dst_owner "
+            "FROM links l JOIN bots s ON s.bot_id=l.src_bot_id "
+            "JOIN bots d ON d.bot_id=l.dst_bot_id WHERE l.id=?",
+            (int(link_id),)) if link_id.isdigit() else None
+        if not row:
+            return self.send_menu_section(uid, None, msg_id, "links")
+        if which == "src" and int(row["src_owner"]) != uid:
+            return self.send_link_card(uid, chat, msg_id, link_id)
+        if which == "dst" and int(row["dst_owner"]) != uid:
+            return self.send_link_card(uid, chat, msg_id, link_id)
+        current = str(row["policy_src"] if which == "src" else row["policy_dst"])
+        self.db.set_link_policy(int(link_id), which, "auto" if current == "ask" else "ask")
+        self.db.event("link_policy_changed", owner=uid, link=int(link_id), which=which)
+        self.send_link_card(uid, chat, msg_id, link_id)
+
     def send_client_card(self, uid: int, chat: Any, msg_id: Any, client_id: str) -> None:
         back = [[("⬅️ Клиенты", "hub:menu:clients"), ("❌ Закрыть", "hub:menu:close")]]
         row = self.db.client(uid, client_id)
@@ -1641,9 +1703,12 @@ class Hub:
                 rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
             elif section == "links":
                 found = self.db.links_for_owner(uid)
-                text = ("Связи:\n" + "\n".join(
-                    f"• #{r['id']} @{r['src_username']} → @{r['dst_username']}" for r in found)
-                    if found else "Связей нет. /share <алиас>")
+                text = ("Связи — нажмите, чтобы настроить политики:" if found
+                        else "Связей нет. /share <алиас>")
+                rows = [[(f"🔗 #{r['id']} @{r['src_username']} → @{r['dst_username']} "
+                          f"({r['policy_src']}/{r['policy_dst']})", f"hub:lnk:{r['id']}")]
+                        for r in found] or []
+                rows.append([("⬅️ Меню", "hub:menu:main"), ("❌ Закрыть", "hub:menu:close")])
             elif section == "protocol":
                 text = protocol.AGENT_PROTOCOL
             else:
