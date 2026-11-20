@@ -438,6 +438,12 @@ class Hub:
                 self.db.event(f"task_{final}", task_id=task_id, owner=owner, via="rpc")
                 return self.say(bot_id, rpc.rpc_ok(rpc_id,
                                                    {"task": rpc.task_view(self.db.task(task_id))}))
+            if str(task["status"]) in TERMINAL:
+                # Поздний/повторный апдейт по закрытой задаче: только фиксируем, без последствий.
+                self.db.event("late_update_ignored", task_id=task_id, owner=owner,
+                              status=str(task["status"]), chars=len(text))
+                return self.say(bot_id, rpc.rpc_ok(rpc_id,
+                                                   {"task": rpc.task_view(self.db.task(task_id))}))
             # completed либо legacy-вызов без state: текст = финальный ответ
             verdict = "done" if (text or state == "completed") else "skip"
             self.on_reply(bot, {"t": "reply", "task": task_id, "verdict": verdict,
