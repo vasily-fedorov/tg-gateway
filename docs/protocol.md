@@ -1,29 +1,28 @@
-# tg-gateway protocol v1
+# tg-gateway protocol v1.1
 
 Основной транспорт — **Telegram DM** (бот-хаб ↔ бот-агент). Контракт — **JSON-RPC 2.0**
-с объектами в духе A2A v1.0. Плагин агента живёт отдельно (`hermes-tg-gateway`).
-
+с объектами A2A v1.0. Плагин агента живёт отдельно (`hermes-tg-gateway`).
 
 Чтобы подключить бота с другого хоста через Telegram, достаточно добавить его в общую
 супергруппу с хабом (Telegram открывает bot-to-bot DM только при общем чате), включить
 Bot-to-Bot Mode и привязать одноразовым кодом.
 
-Формальная часть ниже — источник истины для реализации. Расхождение кода и этой
-спеки считается багом.
+Расхождение кода и этой спеки считается багом.
 
 ## 1. Идентичность и допуск
 
 | Понятие | Значение |
 |---|---|
-| `owner` | tg_id владельца; все `bots/routes/tasks/links` привязаны к нему |
+| `owner` | tg_id владельца; все `bots/routes/tasks` привязаны к нему |
 | `alias` | короткое имя бота в namespace владельца (`god`, `aa`), уникально в паре (owner, alias) |
 | `bot_id` | Telegram user id бота; один бот принадлежит ровно одному владельцу |
-| pairing | `/pair <code> <alias>` от бота в ЛС хабa; код одноразовый, выдаётся владельцем |
+| pairing | `/pair <alias>` → код в ЛС владельца → `/pair <код> <alias>` от бота |
 | доступ | по умолчанию **закрыт**: только tg_id из `TG_GATEWAY_OWNERS` (`TG_GATEWAY_OPEN=0`) |
 
-## 2. Конверт
+Межвладельческих связей и внешних A2A-клиентов нет: хаб работает с парами
+«владелец + его боты».
 
-Все сообщения — один JSON-объект в одном сообщении Telegram.
+## 2. Конверт
 
 ```json
 {"jsonrpc":"2.0","id":"<rpc-id>","method":"<method>","params":{...}}
@@ -31,64 +30,48 @@ Bot-to-Bot Mode и привязать одноразовым кодом.
 
 Ответ: `result` либо `error{code,message}`. Коды: `-32700` parse, `-32600` invalid
 request, `-32601` method not found, `-32602` invalid params, `-32603` internal,
-`-32001` task not found, `-32002` task not cancelable, `-32003` бот не разрешён клиенту,
-`-32004` unauthorized, `-32005` лимит частоты клиента.
+`-32001` task not found, `-32002` task not cancelable, `-32003` бот не разрешён.
 
 ### Общие правила доставки
 
 | Правило | Значение |
 |---|---|
-| TTL конверта | `params.ttl_seconds` (по умолчанию **300**), метка `params.metadata.sent_at` (unix). Просроченное → `-32602` |
+| TTL конверта | `params.ttl_seconds` (по умолчанию **300**), метка `metadata.sent_at` (unix). Просроченное → `-32602` |
 | Идемпотентность | `params.message.messageId` — повтор возвращает ту же задачу с `deduplicated: true` |
-| Отпечаток | `sha256("<src>:<dst>:<text>")`, окно **300 с** — ловит повтор того же текста с новым `messageId` |
+| Отпечаток | `sha256("<src>:<dst>:<text+attachments>")`, окно **300 с** |
 | Лимиты | `max_text` (3000) и `per_hour` (20) на маршрут |
-| Фильтры | секреты (ключи, токены, «пароль: …»), shell-инъекции — отказ `-32602` |
-| Глубина | `hops` ≤ **3**; 4-е сообщение не доставляется, задача → `failed(hop_limit)` |
-| Здоровье пира | 3 неудачные доставки → пир блокируется на 300 с (`peer_blocked`) |
+| Глубина | `hops ≤ 6`; возврат ответа глубину **не** увеличивает |
+| Здоровье пира | 3 неудачные доставки → блокировка на 300 с (`peer_blocked`) |
+| Петля | ответ на ответ (`direction=reply`) новую задачу не создаёт |
 
 ## 3. Методы
-> **Асинхронность (обязательно).** `message/send` возвращается сразу: задача создана,
-> состояние `TASK_STATE_AUTH_REQUIRED` (ждёт подтверждения) или `TASK_STATE_WORKING` (auto).
-> Результат забирают через `tasks/get` / `tasks/list` — синхронного ожидания нет ни у одной
-> стороны. `tasks/update` — внутренний канал исполнителя (закрыт токеном бота), не публичный
-> A2A-метод: `working` = прогресс/хартбит, `input-required` = вопрос, `completed` = финал
-> с artifact.
 
+> **Асинхронность обязательна.** `message/send` возвращается сразу: задача создана,
+> состояние `TASK_STATE_AUTH_REQUIRED` (ждёт подтверждения владельца) или
+> `TASK_STATE_WORKING` (политика `auto`). Результат забирают `tasks/get` / `tasks/list`.
+> Синхронного ожидания внутри вызова нет ни у одной стороны.
 
-### 3.1 `message/send` — агент → хаб
+Публичная поверхность — только spec-методы (`message/send`, `tasks/get`, `tasks/list`,
+`tasks/cancel`, `agent/card`). `tasks/update` — **внутренний** канал исполнителя,
+закрытый токеном бота.
+
+### 3.1 `message/send` — клиент (default-профиль) → хаб
 
 ```json
 {"jsonrpc":"2.0","id":"r-1","method":"message/send","params":{
   "message":{"role":"user","messageId":"m-…","contextId":"ab12",
              "parts":[{"kind":"text","text":"…"}]},
   "to":"aa",
-  "ttl_seconds":300,
-  "metadata":{"hops":1,"sent_at":1795037000.0}}}
+  "metadata":{"hops":1,"transport":"telegram"}}}
 ```
 
-`to` — локальный алиас или `@username` бота, связанного через `/share` + `/link`
-(межвладельческая связь). Итог: `result.task` — Task в состоянии `auth-required`
-(ждём карточку владельца) либо сразу `working`, если подтверждение не требуется.
+`to` — алиас бота владельца. Итог: `result.task` — Task в `auth-required` (нужна карточка)
+или `working` (маршрут `auto`). `params.wait_seconds` больше не используется: ожидания нет.
 
-Нужно ли подтверждение — решается по цепочке (первое совпадение):
+Решение о подтверждении — по маршруту `(src → dst)`:
 
-1. `clients.policy` внешнего клиента (`ask` | `auto`), если он не `inherit`;
-2. `bots.a2a_policy` получателя;
-3. `TG_GATEWAY_A2A_POLICY` (по умолчанию `ask`).
-
-Для бот-задач вместо клиента берётся политика маршрута `(src → dst)`; новое исходящее
-всегда спрашивает владельца, продолжение по тому же `ctx` — по политике маршрута.
-
-`params.wait_seconds` (или `TG_GATEWAY_A2A_WAIT`, дефолт 0) — сколько хаб держит
-соединение, дожидаясь клика/ответа агента, чтобы клиент без поллинга получил результат
-в том же вызове. Максимум 100 с.
-
-### 3.6 Результат задачи в `task`
-
-- `artifacts[0].parts[0].text` — **ответ агента** (`artifactId = <task>-out`);
-- `history` — сообщения задачи: `user` (вход) и `agent` (ответ); `historyLength`
-  ограничивает их число (0 — без истории, не задано — все);
-- входной текст без ответа виден в `history[0]` (роль `user`) и в `message/send` либо `working` (политика `auto` для продолжения).
+- `policy=ask` (по умолчанию) → карточка владельцу, задача в `auth-required`, пока не кликнут;
+- `policy=auto` → доставка сразу, задача `working`.
 
 ### 3.2 `message/send` — хаб → агент (доставка задачи)
 
@@ -96,148 +79,174 @@ request, `-32601` method not found, `-32602` invalid params, `-32603` internal,
 {"jsonrpc":"2.0","id":"d-ab12","method":"message/send","params":{
   "message":{"role":"user","messageId":"m-<task>","contextId":"ab12",
              "parts":[{"kind":"text","text":"…"},
-                      {"kind":"data","data":{"free_gb":31}}]},
-  "metadata":{"task":"3fe6f7","hops":2,"from":"god","sent_at":1795037000.0}}}
+                      {"kind":"data","data":{"context":[…]}}]},
+  "metadata":{"task":"3fe6f7","hops":2,"from":"god","sent_at":1795037000.0,
+              "kind":"request"}}}
 ```
 
-Агент обязан обработать `parts` любого из трёх видов (см. §5) и ответить `tasks/update`.
+`metadata.kind`:
 
-### 3.3 `tasks/update` — агент → хаб (результат)
+- `request` — задача, исполнитель обязан ответить `tasks/update`;
+- `answer` — **ответ** на прежнюю задачу: исполнитель кладёт текст в инбокс и хода не
+  делает; хаб закрывает такую задачу сам при доставке.
+
+### 3.3 `tasks/update` — агент → хаб (внутренний канал)
 
 ```json
 {"jsonrpc":"2.0","id":"u-1","method":"tasks/update","params":{
-  "task":"3fe6f7","contextId":"ab12",
-  "status":{"state":"completed"},
-  "artifact":{"artifactId":"out-1","parts":[{"kind":"text","text":"31 ГБ"}]}}}
+  "task":"3fe6f7",
+  "status":{"state":"TASK_STATE_WORKING",
+            "message":{"parts":[{"kind":"text","text":"принял, выполняю"}]}}}}
 ```
 
-`status.state`:
-- `completed` + непустой artifact → ответ уходит инициатору;
+Разбор **state-aware** (принимаются и `TASK_STATE_*`, и короткие имена):
+
+- `working` / `submitted` / `auth-required` → прогресс + хартбит: задача остаётся живой,
+  текст попадает в `tasks.progress` и в историю (`event: task_progress`);
+- `input-required` → вопрос по существу: `status.question`, карточка владельцу;
+- `completed` + `artifact.parts[]` → финальный ответ (уходит инициатору);
 - `completed` без artifact → `skipped` (гасит цепочку);
-- `input-required` + `status.message.parts` → владельцу карточка-вопрос;
-- `failed` → задача закрыта как failed.
+- `failed` / `canceled` / `rejected` → терминальное состояние с причиной в `progress`.
+
+По уже закрытой задаче апдейты игнорируются (`late_update_ignored`,
+`late_progress_ignored`).
 
 ### 3.4 `tasks/get`, `tasks/list`, `tasks/cancel`
 
 ```json
-{"jsonrpc":"2.0","id":"g-1","method":"tasks/get","params":{"id":"3fe6f7"}}
-{"jsonrpc":"2.0","id":"p-1","method":"tasks/list","params":{"since":1795037000.0,"limit":50}}
+{"jsonrpc":"2.0","id":"g-1","method":"tasks/get","params":{"id":"3fe6f7","historyLength":10}}
+{"jsonrpc":"2.0","id":"p-1","method":"tasks/list","params":{"limit":20,"cursor":0,"status":"working"}}
 {"jsonrpc":"2.0","id":"c-1","method":"tasks/cancel","params":{"id":"3fe6f7"}}
 ```
 
-`tasks/list` — **поллинг вместо ожидания пушей**: отдаёт задачи, где вызывающий бот
-`src` или `dst`, с `updated_at > since`, и `cursor` для следующего запроса.
-`tasks/cancel` — только инициатор; получателю уходит `tasks/cancel` от хаба.
+`tasks/get` отдаёт:
+
+```json
+{"task":{
+  "id":"3fe6f7","contextId":"ab12","kind":"task",
+  "status":{"state":"TASK_STATE_WORKING","timestamp":"…",
+            "message":{"role":"agent","parts":[{"kind":"text","text":"выполняю, 3 мин"}]}},
+  "artifacts":[{"artifactId":"3fe6f7-out","parts":[{"kind":"text","text":"<ответ>"}]}],
+  "history":[{"role":"user","parts":[…]},{"role":"agent","parts":[…]}],
+  "metadata":{"progress":"…","heartbeat":"…","updatedAt":"…","from":"god","to":"aa",
+              "humanApproval":true}}}
+```
+
+- `artifacts` появляются только у завершённой задачи; `history` — переписка задачи
+  (`task_messages`), `historyLength` ограничивает число сообщений;
+- `tasks/list` сортирует по `updated_at DESC`, отдаёт `nextCursor` (курсор вниз);
+- `tasks/cancel` — только нетерминальные; исполнителю уходит `tasks/cancel`.
 
 ### 3.5 `agent/card` — discovery
 
 ```json
 {"jsonrpc":"2.0","id":"k-1","method":"agent/card","params":{"alias":"aa"}}
-→ {"result":{"card":{"name":"@aa","capabilities":{...},"skills":[...]}}}
+→ {"result":{"card":{"name":"@aa","capabilities":{…},"skills":[…]},
+             "routes":[…]}}
 ```
 
-Без `alias` — карточка хаба и всех ботов владельца. `skills[].description` берётся из
-`/describe <alias> …`.
-
-Ответ содержит `routes[]` — **актуальный список адресатов для спрашивающего бота**
-(все включённые боты владельца, кроме него самого) с политикой и лимитами:
-
-```json
-{"routes":[{"alias":"god","username":"fvv_god_bot","policy":"ask",
-            "max_text":3000,"per_hour":20,"context":"on","explicit_route":true}]}
-```
-
-Это источник истины для агента: локальный `gateway-routes.json` в плагине остаётся
-только как адрес хаба и фолбэк, когда хаб недоступен.
+Без `alias` — своя карточка + `agents[]` + `routes[]`. `routes[]` — актуальный список
+адресатов для спрашивающего бота с `policy`/`max_text`/`per_hour`/`context`.
+Это источник истины; локальный `gateway-routes.json` у агента — только адрес хаба и фолбэк.
 
 ## 4. Состояния задачи
 
 ```
 auth-required ──клик владельца──▶ working ──▶ completed
       │                              │  ▲
-      │                              │  └── input-required (вопрос владельцу)
+      │                              │  └── input-required (вопрос)
       └── отказ ──▶ rejected         └──▶ failed | canceled
 ```
 
-| Наше состояние | В A2A |
+| Наше состояние | A2A `TASK_STATE_*` |
 |---|---|
-| `submitted` (ждёт карточку) | `auth-required` |
-| `working` | `working` |
-| `input-required` | `input-required` |
-| `completed` / `failed` / `rejected` / `cancelled` | одноимённые (`canceled`) |
-| `skipped` (нечего отвечать) | `completed` + `metadata.skipped: true` |
+| `submitted` (ждёт карточку) | `AUTH_REQUIRED` |
+| `working` | `WORKING` |
+| `input-required` | `INPUT_REQUIRED` |
+| `completed` / `failed` / `rejected` / `cancelled` | одноимённые (`CANCELED`) |
+| `skipped` (нечего отвечать) | `COMPLETED` + `metadata.skipped: true` |
+
+`AUTH_REQUIRED` — штатное interrupted-состояние спеки: блокирующий клиент обязан получить
+ответ на нём, поэтому клик владельца протокол не ломает.
 
 ## 5. Parts
 
 | kind | Поле | Что делает хаб |
 |---|---|---|
 | `text` | `text` | склеивается в тело сообщения |
-| `data` | `data` (JSON) | сохраняется в `tasks.attachments`, доезжает до пира как `data`-часть, в модель агента попадает JSON-текстом |
-| `file` | `file{name,mimeType,uri}` | бинарь **не** передаётся: доезжает как `file`-часть со ссылкой и строкой `[файл: name]` в теле |
+| `data` | `data` (JSON) | сохраняется в `tasks.attachments`, доезжает до пира как `data`-часть |
+| `file` | `file{name,mimeType,uri}` | бинарь **не** передаётся: доезжает ссылкой + `[файл: name]` |
 
-Файловые блобы сознательно не поддерживаются: Telegram-канал не даёт гарантий
-целостности, а агент не должен получать доступ к ФС по ссылке из недоверенного текста.
+## 6. Роли: клиент, исполнитель, хаб
 
-## 6. Человек в разрыве (расширение)
+- **Клиент** — обычный профиль агента. Инструменты: `relay_send` (отправка),
+  `relay_status` (= `tasks/get`), `relay_inbox` (ответы, пришедшие асинхронно),
+  `relay_cancel`. Нативный `a2a_call` использовать не нужно: он синхронный.
+- **Исполнитель** — профиль `gateway` агента, единственный вход: применяет политику
+  (скан/рамка/redaction), сразу отвечает `working`, работу отдаёт
+  `delegate_task(profile="default")`, ответ присылает ребёнок инструментом
+  `relay_answer(task_id, text)`. Текст модели gateway в хаб не попадает.
+- **Хаб** — A2A-сервер и владелец состояния: карточки, маршруты, прогресс, история,
+  артефакты. Плагин задач не хранит.
 
-- Новый исходящий запрос → карточка владельцу с кнопками; без клика ничего не уходит.
-- Продолжение по тому же `contextId` — по политике маршрута (`ask`/`auto`).
-- Межвладельческая связь: `/share` (приглашение) + `/link`, подтверждения **с двух сторон**
-  (`policy_src` и `policy_dst`).
-- Карточка = единственная авторизация; кодов `APPROVE` нет.
-- `capabilities.humanApproval: true` в карточке хаба — это про данное расширение.
+Алиасы `a2a_answer`/`a2a_inbox` существуют, но платформа не отдаёт модели имена с
+префиксом `a2a_` — рабочие имена `relay_*`.
 
-## 7. Отношение к A2A и A2A-TG
+## 7. Человек в разрыве
 
-- **A2A (Linux Foundation)**: берём словарь и структуры (Task, TaskStatus, Part,
-  AgentCard, JSON-RPC методы), но не HTTP-транспорт и не streaming/push — их в
-  Telegram нет (`capabilities.streaming/pushNotifications: false`).
-- **A2A-TG (telegram-ai-bridge)**: похожая идея конверта с TTL и дедупом; отличия —
-  у нас есть state machine, `tasks/*`, карточки владельца и мультитенантность, зато
-  мы допускаем DM-транспорт (у них только группы, `chat_id < 0`).
-- Совместимость с внешними A2A-агентами **не заявляется** и не поддерживается.
+- Новый исходящий запрос по маршруту `ask` → карточка владельцу с кнопками; без клика
+  ничего не уходит; снаружи это `auth-required`.
+- Продолжение по тому же `contextId` — по политике маршрута.
+- `input-required` — это вопрос по существу (не путать с разрешением на отправку).
+- Карточка — единственная авторизация; кодов `APPROVE` нет.
+- `capabilities.humanApproval: true` в карточке хаба — про это расширение.
+
+## 8. Отношение к A2A и A2A-TG
+
+- **A2A (Linux Foundation)**: совпадают структуры (Task, TaskStatus, Part, AgentCard),
+  методы (`message/send`, `tasks/get|list|cancel`) и асинхронная модель
+  (`returnImmediately` + опрос). Транспорт — Telegram, поэтому `streaming` и
+  `pushNotifications` честно `false`.
+- **A2A-TG (telegram-ai-bridge)**: похожий конверт с TTL и дедупом; у нас есть машина
+  состояний, `tasks/*`, карточки владельца и прогресс задачи.
+- Совместимость с внешними A2A-агентами по HTTP не поддерживается (фронт снят).
 
 ## 9. Контекст ветки (contextId)
 
-`contextId` — не общая память, а ветка: хаб помнит задачи с этим `ctx` и передаёт
-получателю сжатую выжимку предыдущих ходов.
+`contextId` — ветка, не общая память: хаб помнит задачи с этим `ctx` и передаёт получателю
+сжатую выжимку прошлых ходов.
 
-- `GetTask` понимает `historyLength` (0 — без истории, N — последние N сообщений, не задано — все);
-- `ListTasks` фильтрует по `contextId` (и `status`);
-- при доставке боту в `message/parts` добавляется `{kind: "data", data: {context: [{from,to,
-  question,answer,state}, ...]}}` — до 5 ходов, 240 символов на поле; в `metadata.contextTurns`
-  число переданных ходов;
-- выключается на маршруте (`context_mode='off'`, в меню — «🧠 Контекст → выкл»); для задач
-  внешних клиентов берётся маршрут `'' → <bot>`;
-- выжимка собирается только по своей ветке и только для получателя: агенты по-прежнему не
-  видят чужие задачи и не имеют общего хранилища.
+- `tasks/get` понимает `historyLength` (0 — без истории, N — последние N, не задано — все);
+- `tasks/list` фильтрует по `contextId` и `status`;
+- при доставке в `message/parts` добавляется
+  `{kind:"data", data:{context:[{from,to,question,answer,state}, …]}}` — до 5 ходов,
+  240 символов на поле; число ходов в `metadata.contextTurns`;
+- выключается на маршруте (`context_mode='off'`, меню «🧠 Контекст → выкл»).
 
-## 10b. Видимость маршрутов (routes_mode)
+## 10. Видимость маршрутов (routes_mode)
 
-У каждого бота есть режим видимости адресатов:
+- `explicit` (**по умолчанию**) — бот видит только себя и тех, на кого есть явный маршрут;
+  только что привязанный бот не видит никого и не виден другим;
+- `all` — видит всех ботов владельца; адресат без маршрута доступен с `ask`.
 
-- `explicit` (**по умолчанию**, начиная с 0.6.0) — бот видит **только себя и тех, на кого
-  есть явный маршрут**; новый бот, только что привязанный, не видит никого и не виден другим;
-- `all` — бот видит всех включённых ботов владельца; адресат без явного маршрута доступен
-  с политикой `ask` (прежнее поведение, включается в меню бота). Скрытые боты
-  не попадают ни в `agent/card.agents`, ни в `routes`, и отправить им нельзя: хаб отвечает
-  «нет маршрута» и пишет событие `hidden_dst_refused` (существование адресата не
-  подтверждается).
-
-Переключается в меню «🤖 Боты» → карточка бота → «👁 Маршруты». Так один владелец может
-держать несколько независимых групп: бот A не знает о существовании бота C, хотя оба его.
+Скрытым бот не попадает в `agent/card.agents`/`routes`, отправка отклоняется «нет маршрута»
+(`hidden_dst_refused`), существование адресата не подтверждается. Переключатель — меню
+бота → «👁 Маршруты».
 
 ## 11. Аудит
 
-Хаб: таблица `events` (`relay_parked`, `card_approved`, `delivered`, `reply_parked`,
-`a2a_parked`, `a2a_auto_delivered`, `a2a_answered`, `a2a_input_required`, `a2a_skipped`,
-`client_created`, `client_auth`, `client_denied`, `client_rate_limited`,
-`client_token_rotated`, `client_revoked`, `client_expiry_changed`, `client_bots_changed`,
-`route_context_changed`, `menu_*`,
-`bot_routes_mode_changed`, `hidden_dst_refused`, `link_policy_changed`, `cross_inbound_parked`, `cross_inbound_approved`,
-`cross_inbound_rejected`, `card_expired_peer`,
-`task_skipped`, `ttl_rejected`, `rpc_dedup`, `rpc_dedup_fingerprint`, `hop_limit`,
-`peer_blocked`, `peer_circuit_open`, `card_unauthorized`, `hub_error`).
-Агент: `logs/gateway-relay-audit.jsonl` (`hub_inbound`, `rpc_tasks_update`,
-`hub_rpc_result`, `inbound_answered`, `inbound_skipped`, `task_input_required`).
-В аудит пишутся hash/длины, не текст.
+Хаб (`events`): `relay_parked`, `relay_auto`, `card_approved`, `card_rejected`, `delivered`,
+`deliver_failed`, `task_progress`, `task_completed`, `task_input_required`, `task_skipped`,
+`task_failed`, `task_cancelled`, `reply_parked`, `reply_auto`, `late_update_ignored`,
+`late_progress_ignored`, `card_expired`, `ttl_rejected`, `rpc_dedup`,
+`rpc_dedup_fingerprint`, `hop_limit`, `peer_blocked`, `peer_circuit_open`,
+`card_unauthorized`, `hidden_dst_refused`, `route_context_changed`, `bot_described`,
+`owner_log`, `menu_*`.
+
+Агент (`logs/gateway-relay-audit.jsonl`): `hub_inbound`, `hub_answer_inbox`,
+`endpoint_delegate`, `endpoint_turn_done`, `endpoint_answer`, `endpoint_skip_inflight`,
+`rpc_tasks_update`, `rpc_tasks_get`, `hub_rpc_result`, `inbound_refused`,
+`inbound_danger_neutralized`, `inbound_code_annotated`, `ask_default_failed`,
+`profile_turn_error`, `inbox_hint`.
+
+В аудит пишутся длины, правила и хэши — не текст сообщений.

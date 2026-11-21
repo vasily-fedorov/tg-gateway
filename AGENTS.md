@@ -8,12 +8,12 @@
 | Файл | Назначение |
 |---|---|
 | `hub/app.py` | диспетчер апдейтов, JSON-RPC методы, карточки, команды владельца. |
-| `hub/db.py` | SQLite-схема и DAO (bots, routes, tasks, events, links, invites, peer_health, inbox_msgs, owners). |
+| `hub/db.py` | SQLite-схема и DAO (owners, bots, pair_codes, routes, tasks, task_messages, events, inbox_msgs, peer_health). |
 | `hub/rpc.py` | A2A-объекты (Task/TaskStatus/Part/AgentCard), коды ошибок, маппинг состояний. |
 | `hub/policy.py` | лимиты, hops, фильтры секретов, TTL, отпечаток содержимого. |
 | `hub/protocol.py` | текст протокола для агента (`/protocol`, RPC `agent/protocol`). |
 | `hub/tg.py` | Bot API (long polling, send/edit/callback, прокси). |
-| `docs/protocol.md` | **контракт** (Telegram + HTTP). Меняется — версия протокола меняется. |
+| `docs/protocol.md` | **контракт** (Telegram, асинхронный A2A). Меняется — версия протокола меняется. |
 | `tests/test_hub.py` | единственный набор тестов хаба (группы `res[...]`). |
 | `deploy/` | systemd user-unit + `install.sh`. |
 
@@ -29,15 +29,21 @@ python3 -c "import ast; ast.parse(open('hub/app.py').read())"
 1. **Кнопка = подтверждение.** Доставка только из `on_callback` после клика владельца задачи.
 2. **Новый исходящий спрашивает владельца**, продолжение по тому же `ctx` — по политике маршрута.
 3. **Чужой клик невозможен**: `task.owner_tg == uid`, иначе `card_unauthorized`.
-4. **Глубина**: `hops ≤ 3`; 4-е сообщение не доставляется (`failed(hop_limit)`).
+4. **Глубина**: `hops ≤ 6`; ответ на задачу глубину не увеличивает, ответ на ответ новую
+   задачу не создаёт (петля гасится в `on_reply`, `deliver` закрывает reply-задачу сразу).
 5. **Дедуп**: `messageId` + отпечаток `sha256(src:dst:text+attachments)`, окно 300 с.
 6. **TTL конверта** 300 с по `metadata.sent_at`.
 7. **Секреты не пересылаются**: `policy.scan_text` на любом исходящем.
 8. **Аудит** каждого решения; hash/длины, не текст.
 9. **Совместимость**: меняешь поля в `docs/protocol.md` → поднимай `PROTOCOL_VERSION`
    (в `hub/rpc.py`) и синхронно обновляй плагин в `hermes-tg-gateway`.
-10. **Политика A2A**: `clients.policy` → `bots.a2a_policy` → `TG_GATEWAY_A2A_POLICY` → `ask`.
-    Клиент со `auto` не спрашивает владельца, но лимиты, фильтры и глубина действуют.
+10. **Асинхронность**: `message/send` возвращает Task сразу (`auth-required` при `ask`,
+    `working` при `auto`); результат — только `tasks/get`/`tasks/list`. `tasks/update` —
+    внутренний канал исполнителя и разбирается по `status.state` (working = прогресс и
+    хартбит, input-required = вопрос, completed = финал с artifact). Апдейты по
+    терминальной задаче игнорируются.
+11. **Политика подтверждения**: только маршрут `(src → dst)` — `ask` по умолчанию,
+    `auto` отключает карточку. Внешних клиентов и межвладельческих связей нет.
 11. **`artifacts` — результат**: ответ агента лежит в `artifacts[0]`, вход и ответ —
     в `history` (так его читает клиент Hermes).
 12. **Discovery закрыт**: аноним получает 401; с токеном клиента видны только его боты;
