@@ -60,7 +60,6 @@ TG_GATEWAY_OWNERS=<tg_id владельца>
 TG_GATEWAY_OPEN=0          # 1 — разрешить самостоятельную регистрацию владельцев
 TG_GATEWAY_DB=/home/<user>/tg-gateway/hub.sqlite3
 TG_GATEWAY_PROXY=<http-прокси>  # если до api.telegram.org нужен прокси
-# опционально — HTTP-фронт для внешних A2A-клиентов:
 TG_GATEWAY_A2A_PORT=18765          # 0 = выключен
 TG_GATEWAY_A2A_HOST=127.0.0.1      # наружу — через nginx + TLS
 TG_GATEWAY_A2A_TOKEN=<bearer>      # legacy-токен владельца
@@ -75,76 +74,25 @@ bash deploy/install.sh     # user-unit tg-gateway-hub
 Боту в @BotFather нужны: **Bot-to-Bot Communication Mode** и членство в одной группе с
 ботами-агентами (Telegram открывает bot-to-bot DM только при общем чате).
 
-## Внешние клиенты: токены и лимиты
+## Асинхронная модель
 
-Меню → «🔑 Клиенты» (или `/clients`). Новый клиент создаётся мастером: имя → токен
-(`tgw_<client_id>_<secret>`, показывается один раз, в БД только sha256 + префикс).
+Хаб — **A2A-сервер**, а не релеграф с ожиданием:
 
-Для каждого клиента настраивается: разрешённые боты (кнопки ✅/⬜), политика
-(`inherit` — как у бота, `ask` — карточка, `auto` — доставка сразу), лимиты
-(`max_text`, запросов в минуту и в час), состояние (ротация токена, отзыв).
+- `message/send` возвращается сразу: `TASK_STATE_AUTH_REQUIRED` (политика `ask` — ждёт
+  клика владельца) или `TASK_STATE_WORKING` (политика `auto`).
+- `tasks/get` / `tasks/list` — состояние, прогресс, ответ (artifact), история.
+- `tasks/update` — **внутренний** канал исполнителя (закрыт токеном бота):
+  `working` = прогресс/хартбит, `input-required` = вопрос, `completed` = финал.
+- `tasks/cancel` — только нетерминальные, пробрасывается исполнителю.
+- Ответ на ответ новую задачу не создаёт (петля гасится на хабе) + дедуп по `messageId`.
 
-- `TG_GATEWAY_A2A_TOKEN` остаётся **legacy-токеном владельца**: все боты, без лимитов,
-  видит все задачи (обратная совместимость);
-- клиентский токен: только свои боты (`-32003 forbidden_bot` иначе), свои лимиты
-  (`-32005 rate_limited`), свои задачи — `GetTask`/`CancelTask`/`ListTasks` чужих не видят;
-- отзыв/ротация действуют сразу (401), остальные клиенты не затронуты;
-- аудит: `client_created`, `client_auth`, `client_denied` (bot/revoked/expired),
-  `client_rate_limited`, `client_token_rotated`, `client_revoked`; в карточке задачи
-  видно `клиент cl_xxxxxx`.
+## Исполнитель и клиент
 
-## A2A по HTTP (прокси для стандартных клиентов)
-
-Сам хаб живёт в Telegram и URL не имеет. Чтобы к нему мог подключиться обычный
-A2A-клиент (Hermes `a2a_call`, Google ADK, LangChain), хаб поднимает локальный
-HTTP-фронт — тот же код, тот же процесс, та же БД:
-
-```
-A2A client ──HTTP/JSON-RPC──▶ hub :18765 ──карточка──▶ владелец ──клик──▶ бот (Telegram)
-```
-
-Включается переменными:
-
-```
-TG_GATEWAY_A2A_PORT=18765          # 0 = выключено
-TG_GATEWAY_A2A_HOST=127.0.0.1      # наружу — только через nginx + TLS
-TG_GATEWAY_A2A_TOKEN=<bearer>      # без него фронт отвечает 401
-TG_GATEWAY_A2A_WAIT=75             # сколько ждать клика/ответа внутри message/send
-TG_GATEWAY_A2A_PUBLIC_URL=https://a2a.example.com   # что писать в карточке (за nginx)
-```
-
-Что поддерживается:
-
-- `GET /.well-known/agent-card.json` (и алиас `agent.json`) — карточка хаба, боты = skills;
-- `GET /bot/<alias>/.well-known/agent-card.json` — карточка конкретного бота: у неё
-  `supportedInterfaces[].url = <public>/bot/<alias>`, поэтому клиент, знающий только URL,
-  сразу попадает в нужного бота (клиент Hermes не умеет передавать `params.to`);
-- `POST /` JSON-RPC: `message/send`, `tasks/get`, `tasks/list`, `tasks/cancel`,
-  `agent/card`, `agent/protocol`;
-- `GET /health`.
-
-Ветка (`contextId`) поддержана как в спеке: `GetTask(historyLength)`, `ListTasks(contextId)`,
-плюс хаб сам передаёт боту выжимку предыдущих ходов ветки (`data.context`, 5 ходов × 240 символов,
-отключается тумблером «🧠 Контекст» на маршруте).
-
-Методы принимаются и в v1.0-написании: `SendMessage`, `GetTask`, `CancelTask`,
-`ListTasks` (клиент Hermes шлёт именно `SendMessage`).
-
-Честные ограничения: `message/send` **всегда асинхронный** — владелец подтверждает
-карточку, поэтому клиент получает Task в состоянии `auth-required` и дальше поллит
-`tasks/get`. Стриминга и push-вебхуков нет (`capabilities.streaming/pushNotifications =
-false`). Один токен = один владелец (его боты и маршруты).
-
-Пример:
-
-```bash
-curl -s -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:18765/.well-known/agent-card.json
-curl -s -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"message/send",
-       "params":{"to":"aa","message":{"parts":[{"kind":"text","text":"сколько места на /?"}]}}}' \
-  http://127.0.0.1:18765/
-```
+- **Исполнитель** (профиль `gateway` агента): принял → `working` → делегирует работу
+  основному профилю (`delegate_task(profile=default)`) → ответ присылает ребёнок
+  через `relay_answer`/`a2a_answer`; текст модели gateway в хаб не попадает.
+- **Клиент** (обычный профиль): `relay_send` (отправка), `relay_status` (= `tasks/get`),
+  `relay_inbox` (ответы, пришедшие асинхронно), `relay_cancel`.
 
 ## Тесты
 
