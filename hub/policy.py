@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-MAX_HOPS = 3
+MAX_HOPS = 6
 MAX_TEXT = 3000
 PER_HOUR = 20
 
