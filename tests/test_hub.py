@@ -192,6 +192,27 @@ def test_input_required_and_history():
     RES["input_required"] = True
 
 
+def test_reply_needs_no_second_card():
+    """Ответ на задачу доставляется без второй карточки: клик был на исходной задаче."""
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    task_id = send(hub, tg, "вопрос", to="aa")["result"]["task"]["id"]
+    assert hub.db.task(task_id)["status"] == "submitted"
+    hub.handle(cb(OWNER, f"hub:ok:{task_id}"))
+    update(hub, tg, task_id, "TASK_STATE_COMPLETED", "ответ по существу", artifact=True)
+    # ответ ушёл инициатору, но новых карточек нет
+    replies = [t for t in map(dict, hub.db.list_tasks(OWNER)) if t["direction"] == "reply"]
+    assert replies, "должна появиться возвратная задача"
+    assert all(r["status"] in ("working", "completed") for r in replies), replies
+    inbox = delivered(tg, GOD)
+    assert any("ответ по существу" in x["text"] for x in inbox), inbox
+    cards = [s for s in tg.sent if s["chat"] == OWNER and s["buttons"]
+             and "Переслать" in str(s["buttons"])]
+    assert not cards, "карточка на ответ не нужна"
+    RES["reply_no_card"] = True
+
+
 def test_list_cursor_and_sort():
     hub, tg = new_hub()
     pair(hub, tg, bot_id=GOD, alias="god")
@@ -295,7 +316,8 @@ def test_explicit_routes_hide_bots():
 def main() -> int:
     for fn in (test_pair_and_card, test_send_returns_immediately_auth_required,
                test_approve_delivers_and_progress_then_answer, test_input_required_and_history,
-               test_list_cursor_and_sort, test_cancel_propagates, test_reject_card,
+               test_reply_needs_no_second_card, test_list_cursor_and_sort,
+               test_cancel_propagates, test_reject_card,
                test_auto_policy_skips_card, test_dedup_by_message_id, test_card_ttl_expires,
                test_menu_sections, test_explicit_routes_hide_bots):
         fn()

@@ -757,10 +757,9 @@ class Hub:
             self.db.event("hop_limit", task_id=task_id, owner=owner, hops=hops + 1)
             return
         back_id = new_id()
-        route = self.db.route(owner, dst, src)
-        rpolicy = str(route["policy"]) if route else "ask"
-        approve = policy.needs_approval(policy=rpolicy, ctx=task["ctx"], hops=hops + 1,
-                                        direction="reply")
+        # Ответ — не новый запрос: разрешение уже дано кликом на исходную задачу.
+        # Второй клик на каждый ответ превращает обмен в двойное подтверждение.
+        approve = False
         self.db.create_task(task_id=back_id, owner=owner, direction="reply", ctx=task["ctx"],
                             hops=hops, src=dst, dst=src, text=text,
                             status="submitted" if approve else "working")
