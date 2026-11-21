@@ -301,6 +301,26 @@ def test_menu_sections():
     RES["menu"] = True
 
 
+def test_card_screens_open():
+    """Кнопки меню открывают карточки бота/маршрута/задачи без падений (регресс _show)."""
+    hub, tg = new_hub()
+    pair(hub, tg, bot_id=GOD, alias="god")
+    pair(hub, tg, bot_id=AA, alias="aa")
+    hub.db.set_route(OWNER, "god", "aa", policy="ask")
+    task_id = send(hub, tg, "проверка карточки", to="aa")["result"]["task"]["id"]
+    route_id = hub.db.routes(OWNER)[0]["id"]
+    for data in (f"hub:card:god", f"hub:route:{route_id}", f"hub:task:{task_id}",
+                 f"hub:rmode:god", f"hub:rctx:{route_id}", f"hub:desc:god",
+                 "hub:new:pair", "hub:newr:src"):
+        hub.handle(cb(OWNER, data))
+        assert tg.edits or tg.sent, f"{data}: экран не показан"
+    # карточка задачи показывает суть
+    card = [e[2] for e in tg.edits if isinstance(e[2], str) and "🗂" in e[2]]
+    assert card and "проверка карточки" in card[-1], card[-1:]
+
+    RES["card_screens"] = True
+
+
 def test_explicit_routes_hide_bots():
     hub, tg = new_hub()
     pair(hub, tg, bot_id=GOD, alias="god")
@@ -319,7 +339,7 @@ def main() -> int:
                test_reply_needs_no_second_card, test_list_cursor_and_sort,
                test_cancel_propagates, test_reject_card,
                test_auto_policy_skips_card, test_dedup_by_message_id, test_card_ttl_expires,
-               test_menu_sections, test_explicit_routes_hide_bots):
+               test_menu_sections, test_card_screens_open, test_explicit_routes_hide_bots):
         fn()
     print("hub:", json.dumps(RES, ensure_ascii=False, sort_keys=True))
     print(f"OK: {len(RES)} групп хаба")
