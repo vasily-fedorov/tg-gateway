@@ -412,6 +412,10 @@ class Hub:
                         text += str(part.get("text") or "")
             text = text.strip()
             if state in ("working", "submitted", "auth-required"):
+                if str(task["status"]) in TERMINAL:
+                    self.db.event("late_progress_ignored", task_id=task_id, owner=owner)
+                    return self.say(bot_id, rpc.rpc_ok(rpc_id,
+                                                       {"task": rpc.task_view(self.db.task(task_id))}))
                 # Прогресс/хартбит: задача остаётся живой, карточку не трогаем
                 if str(task["status"]) != "submitted":
                     self.db.heartbeat(task_id, text)
@@ -623,8 +627,12 @@ class Hub:
         }
         ok, res = self.tg.send(int(target["bot_id"]),
                                json.dumps(payload, ensure_ascii=False))
-        status = "working" if ok else "failed"
-        self.db.update_task(task_id, status=status, hops=hops)
+        is_answer = str(task["direction"]) == "reply"
+        if ok and is_answer:
+            # Ответ доставлен — это уведомление, работы больше нет: закрываем сразу.
+            self.db.update_task(task_id, status="completed", hops=hops, answer=task["text"])
+        else:
+            self.db.update_task(task_id, status="working" if ok else "failed", hops=hops)
         if ok:
             self.db.peer_ok(dst_alias)
         elif self.db.peer_failed(dst_alias, str(res)):
